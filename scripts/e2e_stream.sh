@@ -9,6 +9,9 @@ RUN="$C run --rm -T spark"
 PAYMENTS="${PAYMENTS:-1000}"
 TOPIC=payments.public.payment_events
 
+landing_days() {  # one word per daily partition, tolerant of CR/LF differences
+  $RUN sh -c 'ls /data/landing' | tr -s '[:space:]' ' ' | sed 's/dt=//g'
+}
 step() { echo; echo "=== $* ==="; }
 topic_hw() {  # high watermark of the CDC topic
   $C exec -T redpanda rpk topic describe "$TOPIC" -p 2>/dev/null | awk 'NR>1 {s+=$6} END {print s+0}'
@@ -52,8 +55,7 @@ $RUN python -m settlelake.spark assert-bronze --expected "$TOTAL"
 
 step "partner statements: split into daily landing partitions, load each day (backfill-style)"
 $RUN python -m settlelake.spark split-landing --raw /data/raw --landing /data/landing
-for d in $($RUN sh -c 'ls /data/landing' | tr -d '
-' | sed 's/dt=//'); do
+for d in $(landing_days); do
   $RUN python -m settlelake.spark ingest --input "/data/landing/dt=$d" --landing-date "$d" --types statement >/dev/null
 done
 
@@ -64,8 +66,7 @@ step "parity: Iceberg gold from the streaming path equals the DuckDB reference"
 $RUN python -m settlelake.spark verify --home /data
 
 step "idempotency: re-ingesting every landing day and rebuilding changes nothing"
-for d in $($RUN sh -c 'ls /data/landing' | tr -d '
-' | sed 's/dt=//'); do
+for d in $(landing_days); do
   $RUN python -m settlelake.spark ingest --input "/data/landing/dt=$d" --landing-date "$d" --types statement >/dev/null
 done
 $RUN python -m settlelake.spark stream --once

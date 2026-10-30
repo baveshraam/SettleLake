@@ -49,7 +49,12 @@ with DAG(
     )
     quality = BashOperator(
         task_id="data_quality",
-        bash_command=f"{SPARK} stage --name quality --run-id airflow_{{{{ run_id | replace(':', '_') | replace('+', '_') }}}}",
+        # run_id reaches the shell only through the environment (quoted), never via string templating
+        bash_command=f'{SPARK} stage --name quality --run-id "airflow_$SAFE_RUN_ID"',
+        env={
+            "SAFE_RUN_ID": "{{ run_id | replace(':', '_') | replace('+', '_') | replace(' ', '_') }}"
+        },
+        append_env=True,
     )
     ingest >> build >> quality
 
@@ -59,7 +64,9 @@ with DAG(
     start_date=datetime(2026, 1, 1),
     schedule=None,
     catchup=False,
-    params={"checkpoint_suffix": Param("replay", type="string", minLength=1, pattern="^[A-Za-z0-9_-]+$")},
+    params={
+        "checkpoint_suffix": Param("replay", type="string", minLength=1, pattern="^[A-Za-z0-9_-]+$")
+    },
     default_args=DEFAULTS,
     tags=["settlelake", "replay"],
 ) as replay:

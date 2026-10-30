@@ -4,7 +4,7 @@ locals {
   bucket_name = "${var.name_prefix}-lake-${data.aws_caller_identity.current.account_id}-${var.region}"
   # Iceberg namespaces used by the Spark jobs map 1:1 to Glue databases.
   databases        = toset(["bronze", "silver", "gold", "ops"])
-  trusted          = length(var.trusted_principal_arns) > 0 ? var.trusted_principal_arns : ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"]
+  trusted          = var.trusted_principal_arns
   warehouse_prefix = "warehouse"
 }
 
@@ -167,7 +167,7 @@ data "aws_iam_policy_document" "spark_jobs" {
     resources = concat(
       ["arn:aws:glue:${var.region}:${data.aws_caller_identity.current.account_id}:catalog"],
       [for d in aws_glue_catalog_database.layer : d.arn],
-      ["arn:aws:glue:${var.region}:${data.aws_caller_identity.current.account_id}:table/*/*"],
+      [for d in aws_glue_catalog_database.layer : "arn:aws:glue:${var.region}:${data.aws_caller_identity.current.account_id}:table/${d.name}/*"],
     )
   }
   statement {

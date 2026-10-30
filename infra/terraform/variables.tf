@@ -17,9 +17,13 @@ variable "force_destroy" {
 }
 
 variable "trusted_principal_arns" {
-  description = "IAM principals allowed to assume the Spark job role. Defaults to the account root."
+  description = "IAM principals (user/role ARNs) allowed to assume the Spark job role. Required: no account-wide default."
   type        = list(string)
-  default     = []
+
+  validation {
+    condition     = length(var.trusted_principal_arns) > 0
+    error_message = "Provide at least one trusted principal ARN."
+  }
 }
 
 variable "athena_bytes_scanned_cutoff" {

@@ -100,6 +100,18 @@ def cmd_sql(a) -> int:
     return 0
 
 
+def cmd_bench(a) -> int:
+    from settlelake.spark.bench import run_engine_benchmark
+
+    r = run_engine_benchmark(os.environ.get("SETTLELAKE_HOME"), a.payments, a.seed)
+    print(
+        json.dumps(
+            {k: r[k] for k in ("workload", "duckdb", "spark_local", "output_parity")}, default=str
+        )
+    )
+    return 0 if r["output_parity"]["identical"] else 4
+
+
 def cmd_stream(a) -> int:
     from settlelake.spark.session import build_spark
     from settlelake.spark.stream import start_stream
@@ -189,6 +201,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     q.add_argument("query")
     q.set_defaults(fn=cmd_sql)
+    bn = sub.add_parser("bench", help="DuckDB vs Spark(local) benchmark with output parity check")
+    bn.add_argument("--payments", type=int, default=10000)
+    bn.add_argument("--seed", type=int, default=42)
+    bn.set_defaults(fn=cmd_bench)
     s = sub.add_parser("stream")
     s.add_argument("--once", action="store_true", help="process available data then stop")
     s.add_argument("--interval", default="5 seconds")
