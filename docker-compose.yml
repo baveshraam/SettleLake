@@ -1,4 +1,25 @@
+# Default services (no profile): the lightweight local MVP - `docker compose up dashboard`.
+# `--profile stream`: Postgres -> Debezium -> Redpanda -> Spark Structured Streaming -> Iceberg on S3-compatible storage.
+# `--profile airflow`: Airflow orchestration of the Spark batch DAGs (see docker/airflow).
+# Credentials below are local development defaults only; override via environment / .env.
+
+x-spark-env: &spark-env
+  SETTLELAKE_HOME: /data
+  SETTLELAKE_CATALOG: jdbc
+  SETTLELAKE_JDBC_URI: jdbc:postgresql://postgres:5432/iceberg_catalog
+  SETTLELAKE_JDBC_USER: ${POSTGRES_USER:-settlelake}
+  SETTLELAKE_JDBC_PASSWORD: ${POSTGRES_PASSWORD:-settlelake}
+  SETTLELAKE_WAREHOUSE: s3://settlelake/warehouse
+  SETTLELAKE_S3_ENDPOINT: http://s3:8333
+  AWS_ACCESS_KEY_ID: dev-access-key
+  AWS_SECRET_ACCESS_KEY: dev-secret-key
+  AWS_REGION: us-east-1
+  KAFKA_BOOTSTRAP: redpanda:9092
+  POSTGRES_DSN: postgresql://${POSTGRES_USER:-settlelake}:${POSTGRES_PASSWORD:-settlelake}@postgres:5432/payments
+  CHECKPOINT_DIR: /data/checkpoints/cdc_to_bronze
+
 services:
+  # ---------------------------------------------------------------- MVP
   pipeline:
     build: .
     command: sh -c "settlelake generate --profile quick --seed 42 && settlelake run && settlelake report"
@@ -17,5 +38,153 @@ services:
       SETTLELAKE_HOME: /data
     volumes:
       - settlelake-data:/data
+
+  # ---------------------------------------------------------------- streaming stack
+  postgres:
+    profiles: [stream, airflow]
+    image: quay.io/debezium/postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-settlelake}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-settlelake}
+      POSTGRES_DB: payments
+    volumes:
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d payments"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redpanda:
+    profiles: [stream]
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --memory=768M
+      - --kafka-addr=internal://0.0.0.0:9092
+      - --advertise-kafka-addr=internal://redpanda:9092
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  connect:
+    profiles: [stream]
+    image: quay.io/debezium/connect:2.7.3.Final
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVERS: redpanda:9092
+      GROUP_ID: settlelake-connect
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_statuses
+      CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      STATUS_STORAGE_REPLICATION_FACTOR: "1"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8083/connectors"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+
+  connector-setup:
+    profiles: [stream]
+    image: curlimages/curl:8.10.1
+    depends_on:
+      connect:
+        condition: service_healthy
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-settlelake}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-settlelake}
+    entrypoint: ["sh", "/register.sh"]
+    volumes:
+      - ./docker/connect/register.sh:/register.sh:ro
+
+  # S3-compatible object store for local development (SeaweedFS). AWS uses real S3 (see infra/terraform).
+  s3:
+    profiles: [stream, airflow]
+    image: chrislusf/seaweedfs:3.85
+    command: server -dir=/data -s3 -s3.port=8333 -s3.config=/etc/seaweed/s3.json
+    volumes:
+      - s3data:/data
+      - ./docker/seaweed/s3.json:/etc/seaweed/s3.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:9333/cluster/status"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  s3-init:
+    profiles: [stream, airflow]
+    image: amazon/aws-cli:2.17.40
+    depends_on:
+      s3:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: dev-access-key
+      AWS_SECRET_ACCESS_KEY: dev-secret-key
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint: ["sh", "-c", "aws --endpoint-url http://s3:8333 s3 mb s3://settlelake || aws --endpoint-url http://s3:8333 s3 ls s3://settlelake"]
+
+  # Tools/batch container: Spark, the settlelake CLI, loaders. `docker compose run --rm spark ...`
+  spark:
+    profiles: [stream, airflow]
+    build:
+      context: .
+      dockerfile: docker/spark.Dockerfile
+    image: settlelake-spark
+    environment: *spark-env
+    volumes:
+      - settlelake-data:/data
+    command: ["settlelake", "--help"]
+
+  # Long-running CDC -> Bronze streaming query (continuous; use `spark ... stream --once` in tests)
+  spark-stream:
+    profiles: [stream]
+    image: settlelake-spark
+    depends_on:
+      connector-setup:
+        condition: service_completed_successfully
+      s3-init:
+        condition: service_completed_successfully
+    environment: *spark-env
+    volumes:
+      - settlelake-data:/data
+    command: ["python", "-m", "settlelake.spark", "stream"]
+    restart: on-failure
+
+  # Airflow in standalone (dev) mode: SQLite metadata + sequential executor. Production would use
+  # an external metadata DB and Celery/Kubernetes executors; DAG code does not change.
+  airflow:
+    profiles: [airflow]
+    build:
+      context: .
+      dockerfile: docker/airflow.Dockerfile
+    image: settlelake-airflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+      s3-init:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080"
+    environment:
+      <<: *spark-env
+      SETTLELAKE_HOME: /home/airflow/settlelake
+    volumes:
+      - settlelake-data:/data:ro
+    command: standalone
+
 volumes:
   settlelake-data:
+  pgdata:
+  s3data:

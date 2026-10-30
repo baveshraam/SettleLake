@@ -28,10 +28,13 @@ class CheckResult:
         return asdict(self)
 
 
-def _checks(s: str, g: str, bronze: str) -> list[tuple[str, str, str, str, str]]:
-    """(name, layer, severity, explanation, sql)."""
-    ev, st = f"read_parquet('{s}/events.parquet')", f"read_parquet('{s}/statements.parquet')"
-    rec = f"read_parquet('{g}/reconciliation.parquet')"
+def _checks(t: dict[str, str]) -> list[tuple[str, str, str, str, str]]:
+    """(name, layer, severity, explanation, sql). `t` maps logical tables to SQL table expressions
+    so the same checks run on DuckDB/Parquet and on Spark/Iceberg."""
+    ev, st, rec, rej, qua, dup = (
+        t[k] for k in ("events", "statements", "rec", "rej", "qua", "dup")
+    )
+    fs, fp, bronze = t["fs"], t["fp"], t["bronze"]
     cur = ", ".join(f"'{c}'" for c in CURRENCIES)
     stat = ", ".join(f"'{c}'" for c in STATEMENT_STATUSES)
     return [
@@ -110,7 +113,7 @@ def _checks(s: str, g: str, bronze: str) -> list[tuple[str, str, str, str, str]]
                (SELECT currency, sum(amount_minor) t FROM {ev} WHERE event_type = 'funds.settled'
                 GROUP BY currency) s
                FULL JOIN (SELECT currency, sum(amount_minor) t
-                          FROM read_parquet('{g}/fact_settlements.parquet') GROUP BY currency) g
+                          FROM {fs} GROUP BY currency) g
                USING (currency))""",
         ),
         (
@@ -119,25 +122,25 @@ def _checks(s: str, g: str, bronze: str) -> list[tuple[str, str, str, str, str]]
             "ERROR",
             "every fact_settlements payment_id exists in fact_payments",
             f"""SELECT count(*), count(*) FILTER (WHERE payment_id NOT IN
-             (SELECT payment_id FROM read_parquet('{g}/fact_payments.parquet')))
-             FROM read_parquet('{g}/fact_settlements.parquet')""",
+             (SELECT payment_id FROM {fp}))
+             FROM {fs}""",
         ),
         (
             "source_schema_compliance",
             "bronze",
             "WARN",
             "bronze records rejected (schema/conflict) or quarantined (malformed) in Silver",
-            f"""SELECT (SELECT count(*) FROM read_parquet({bronze})),
-             (SELECT count(*) FROM read_parquet('{s}/rejected.parquet'))
-             + (SELECT count(*) FROM read_parquet('{s}/quarantine.parquet'))""",
+            f"""SELECT (SELECT count(*) FROM {bronze}),
+             (SELECT count(*) FROM {rej})
+             + (SELECT count(*) FROM {qua})""",
         ),
         (
             "source_duplicate_records",
             "silver",
             "WARN",
             "duplicate event/statement observations removed during deduplication",
-            f"""SELECT (SELECT count(*) FROM read_parquet({bronze})),
-             (SELECT count(*) FROM read_parquet('{s}/duplicates.parquet'))""",
+            f"""SELECT (SELECT count(*) FROM {bronze}),
+             (SELECT count(*) FROM {dup})""",
         ),
         (
             "source_referential_integrity",
@@ -167,17 +170,35 @@ def _checks(s: str, g: str, bronze: str) -> list[tuple[str, str, str, str, str]]
     ]
 
 
-def run_checks(bronze_files: list[Path], silver_dir: Path, gold_dir: Path) -> list[CheckResult]:
-    con = connect()
+def evaluate_checks(execute, tables: dict[str, str]) -> list[CheckResult]:
+    """Run every check; `execute(sql)` must return a single (evaluated, failed) row."""
     out: list[CheckResult] = []
-    checks = _checks(silver_dir.as_posix(), gold_dir.as_posix(), quote_list(bronze_files))
-    for name, layer, severity, explanation, sql in checks:
+    for name, layer, severity, explanation, sql in _checks(tables):
         t0 = time.perf_counter()
-        evaluated, failed = con.execute(sql).fetchone()
+        evaluated, failed = execute(sql)
         ms = (time.perf_counter() - t0) * 1000
         status = "PASS" if failed == 0 else ("FAIL" if severity == "ERROR" else "WARN")
         out.append(
             CheckResult(name, layer, severity, status, int(evaluated), int(failed), ms, explanation)
         )
-    con.close()
     return out
+
+
+def run_checks(bronze_files: list[Path], silver_dir: Path, gold_dir: Path) -> list[CheckResult]:
+    s, g = silver_dir.as_posix(), gold_dir.as_posix()
+    tables = {
+        "events": f"read_parquet('{s}/events.parquet')",
+        "statements": f"read_parquet('{s}/statements.parquet')",
+        "rej": f"read_parquet('{s}/rejected.parquet')",
+        "qua": f"read_parquet('{s}/quarantine.parquet')",
+        "dup": f"read_parquet('{s}/duplicates.parquet')",
+        "rec": f"read_parquet('{g}/reconciliation.parquet')",
+        "fs": f"read_parquet('{g}/fact_settlements.parquet')",
+        "fp": f"read_parquet('{g}/fact_payments.parquet')",
+        "bronze": f"read_parquet({quote_list(bronze_files)})",
+    }
+    con = connect()
+    try:
+        return evaluate_checks(lambda sql: con.execute(sql).fetchone(), tables)
+    finally:
+        con.close()

@@ -53,7 +53,7 @@ class PaymentEvent(BaseModel):
     payment_id: str
     event_time: AwareDatetime
     ingested_at: AwareDatetime
-    schema_version: Literal["1.0"]
+    schema_version: Literal["1.0", "1.1"]
     source: str
     provider: str
     provider_ref: str | None = None
@@ -62,6 +62,7 @@ class PaymentEvent(BaseModel):
     corridor: str
     dest_currency: str | None = None
     dest_amount_minor: StrictInt | None = None
+    channel: Literal["api", "bank", "card"] | None = None  # added in contract 1.1
 
     @field_validator("event_id", "payment_id", "source", "provider", "corridor")
     @classmethod
@@ -85,6 +86,8 @@ class PaymentEvent(BaseModel):
             self.provider_ref and normalize_ref(self.provider_ref)
         ):
             raise ValueError("funds.settled requires provider_ref")
+        if self.channel is not None and self.schema_version == "1.0":
+            raise ValueError("channel requires schema_version 1.1")
         if (self.dest_currency is None) != (self.dest_amount_minor is None):
             raise ValueError("dest_currency and dest_amount_minor must be set together")
         return self

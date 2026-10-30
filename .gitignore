@@ -15,3 +15,7 @@ data/
 *.duckdb.wal
 *.parquet
 .claude/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars

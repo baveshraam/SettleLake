@@ -95,3 +95,15 @@ def test_statement_rejects(over):
 
 def test_statement_amount_minor():
     assert StatementRow.model_validate(stmt_row("s1", "R1", amount="12.50")).amount_minor == 1250
+
+
+def test_contract_v1_1_adds_optional_channel():
+    ok = PaymentEvent.model_validate(settle_event("e1", "R1", schema_version="1.1", channel="api"))
+    assert ok.channel == "api"
+    assert (
+        PaymentEvent.model_validate(settle_event("e1", "R1", schema_version="1.1")).channel is None
+    )
+    with pytest.raises(ValidationError):
+        PaymentEvent.model_validate(settle_event("e1", "R1", channel="api"))  # 1.0 has no channel
+    with pytest.raises(ValidationError):
+        PaymentEvent.model_validate(settle_event("e1", "R1", schema_version="2.0"))

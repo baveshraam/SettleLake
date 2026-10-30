@@ -13,6 +13,7 @@ from pathlib import Path
 
 from settlelake.config import ANOMALY_LEVELS, PROFILES, get_paths
 from settlelake.ingestion.bronze import IngestionError
+from settlelake.observability.logs import setup_logging
 from settlelake.pipeline import STAGES, PipelineError, SimulatedInterruption, replay, run_pipeline
 
 
@@ -163,6 +164,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    setup_logging()
     args = build_parser().parse_args(argv)
     try:
         return args.fn(args)

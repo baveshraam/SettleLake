@@ -11,6 +11,7 @@ Recovery model (single machine, deliberately modest):
 from __future__ import annotations
 
 import hashlib
+import logging
 import shutil
 import time
 import traceback
@@ -29,10 +30,12 @@ from settlelake.ingestion.bronze import (
 from settlelake.ingestion.silver import SILVER_FILES, build_silver
 from settlelake.lakehouse.gold import GOLD_TABLES, build_gold
 from settlelake.lakehouse.store import connect, content_hash
+from settlelake.observability import lineage, metrics
 from settlelake.observability.tracking import Tracker, new_run_id
 from settlelake.quality.checks import run_checks
 from settlelake.reconciliation.engine import reconcile
 
+log = logging.getLogger("settlelake.pipeline")
 STAGES = ["ingest", "silver", "reconcile", "gold", "quality"]
 
 
@@ -55,6 +58,8 @@ class Ctx:
     input_dir: Path | None = None
     simulate_failure: str | None = None
     lake_root: Path = field(default_factory=Path)
+    samples: list = field(default_factory=list)
+    home: Path | None = None  # set for real runs; replays do not emit lineage/metrics
 
     @property
     def bronze_files(self) -> list[Path]:
@@ -172,6 +177,11 @@ def _run_stages(ctx: Ctx, stages: list[str], completed: dict[str, dict] | None =
             continue  # resume: stage already published and verified
         ctx.tracker.start_stage(ctx.run_id, stage)
         t0 = time.perf_counter()
+        ins, outs = lineage.STAGE_DATASETS[stage]
+        job = f"duckdb.{stage}"
+        if ctx.home:
+            lineage.emit("START", job, ctx.run_id, ins, outs, home=ctx.home)
+        log.info("stage started", extra={"run_id": ctx.run_id, "stage": stage})
         try:
             if ctx.simulate_failure == stage:
                 # emulate a crash after a partial temp write, before atomic publish
@@ -181,15 +191,40 @@ def _run_stages(ctx: Ctx, stages: list[str], completed: dict[str, dict] | None =
                 raise SimulatedInterruption(f"simulated interruption during stage '{stage}'")
             rows_in, rows_out, detail, outputs = STAGE_FUNCS[stage](ctx)
         except SimulatedInterruption as exc:
-            ctx.tracker.finish_stage(ctx.run_id, stage, "INTERRUPTED", time.perf_counter() - t0,
-                                     error=str(exc))  # fmt: skip
+            if ctx.home:
+                lineage.emit("ABORT", job, ctx.run_id, ins, outs, home=ctx.home)
+            ctx.tracker.finish_stage(
+                ctx.run_id, stage, "INTERRUPTED", time.perf_counter() - t0, error=str(exc)
+            )
             raise
         except Exception as exc:
-            ctx.tracker.finish_stage(ctx.run_id, stage, "FAILED", time.perf_counter() - t0,
-                                     error=f"{type(exc).__name__}: {exc}")  # fmt: skip
+            if ctx.home:
+                lineage.emit("FAIL", job, ctx.run_id, ins, outs, home=ctx.home)
+            log.error(
+                "stage failed", extra={"run_id": ctx.run_id, "stage": stage, "error": str(exc)}
+            )
+            ctx.tracker.finish_stage(
+                ctx.run_id, stage, "FAILED", time.perf_counter() - t0,
+                error=f"{type(exc).__name__}: {exc}",
+            )  # fmt: skip
             raise
-        ctx.tracker.finish_stage(ctx.run_id, stage, "COMPLETED", time.perf_counter() - t0,
-                                 rows_in, rows_out, detail, outputs)  # fmt: skip
+        seconds = time.perf_counter() - t0
+        ctx.tracker.finish_stage(
+            ctx.run_id, stage, "COMPLETED", seconds, rows_in, rows_out, detail, outputs
+        )
+        log.info(
+            "stage completed",
+            extra={"run_id": ctx.run_id, "stage": stage, "rows_in": rows_in,
+                   "rows_out": rows_out, "seconds": round(seconds, 3)},
+        )  # fmt: skip
+        if ctx.home:
+            lineage.emit("COMPLETE", job, ctx.run_id, ins, outs, home=ctx.home)
+            lab = {"engine": "duckdb", "stage": stage}
+            ctx.samples += [
+                ("settlelake_stage_duration_seconds", lab, seconds),
+                ("settlelake_stage_rows_out", lab, rows_out),
+            ]
+            metrics.write_metrics("duckdb_pipeline", ctx.samples, home=ctx.home)
         for stale in (ctx.bronze_dir, ctx.silver_dir, ctx.gold_dir):
             for tmp in stale.glob("*.partial.tmp"):
                 tmp.unlink()
@@ -238,7 +273,7 @@ def run_pipeline(
             inputs, run_id = last["inputs"], new_run_id()
             tracker.start_run(run_id, "pipeline", inputs, fingerprint_of(inputs))
         ctx = Ctx(run_id, inputs, paths.bronze, paths.silver, paths.gold, tracker, in_dir,
-                  simulate_failure, paths.lake)  # fmt: skip
+                  simulate_failure, paths.lake, home=paths.home)  # fmt: skip
         try:
             _run_stages(ctx, stages, completed)
         except SimulatedInterruption as exc:

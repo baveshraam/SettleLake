@@ -1,4 +1,4 @@
-"""Silver: parse, validate, normalize and deduplicate Bronze records.
+"""Silver (DuckDB engine): parse, validate, normalize and deduplicate Bronze records.
 
 Outputs (all Parquet):
   events, statements   validated, deduplicated business records
@@ -9,17 +9,13 @@ Outputs (all Parquet):
 
 from __future__ import annotations
 
-import csv
-import json
 from collections import defaultdict
 from pathlib import Path
 
 import pyarrow as pa
-from pydantic import ValidationError
 
-from settlelake.config import STMT_COLS
+from settlelake.ingestion.parse import parse_record
 from settlelake.lakehouse.store import connect, quote_list, write_table
-from settlelake.schemas.models import PaymentEvent, StatementRow, make_match_key, to_naive_utc
 
 TS = pa.timestamp("us")
 EVENTS_SCHEMA = pa.schema(
@@ -39,6 +35,7 @@ EVENTS_SCHEMA = pa.schema(
         ("dest_amount_minor", pa.int64()),
         ("schema_version", pa.string()),
         ("source", pa.string()),
+        ("channel", pa.string()),
         ("bronze_record_id", pa.string()),
     ]
 )
@@ -86,35 +83,8 @@ QUARANTINE_SCHEMA = pa.schema(
 )
 
 SILVER_FILES = ["events", "statements", "duplicates", "rejected", "quarantine"]
-
-
-def _best_effort_key(raw_obj: object, record_type: str) -> str | None:
-    """Recover a match key from an invalid-but-parseable record so it can be flagged later."""
-    if not isinstance(raw_obj, dict):
-        return None
-    provider = raw_obj.get("provider")
-    if record_type == "event":
-        ref = raw_obj.get("provider_ref")
-        if raw_obj.get("event_type") != "funds.settled":
-            return None
-    else:
-        ref = raw_obj.get("external_ref")
-    if isinstance(provider, str) and isinstance(ref, str) and provider.strip() and ref.strip():
-        key = make_match_key(provider, ref)
-        return key if not key.endswith("|") else None
-    return None
-
-
-def _err(exc: ValidationError | ValueError) -> str:
-    if isinstance(exc, ValidationError):
-        return "; ".join(
-            f"{'.'.join(map(str, e['loc'])) or 'record'}: {e['msg']}" for e in exc.errors()[:3]
-        )
-    return str(exc)
-
-
-def _is_malformed(exc: ValidationError) -> bool:
-    return any(e["type"] == "json_invalid" for e in exc.errors())
+EVENT_COLS = [f.name for f in EVENTS_SCHEMA if f.name != "bronze_record_id"]
+STMT_OUT_COLS = [f.name for f in STATEMENTS_SCHEMA if f.name != "bronze_record_id"]
 
 
 def build_silver(bronze_files: list[Path], silver_dir: Path) -> dict:
@@ -126,160 +96,90 @@ def build_silver(bronze_files: list[Path], silver_dir: Path) -> dict:
     ).fetchall()
     con.close()
 
-    events: dict[str, list[tuple[PaymentEvent, str]]] = defaultdict(list)
-    statements: list[tuple[StatementRow, str]] = []
+    events: dict[str, list[tuple[dict, str, str]]] = defaultdict(list)
+    statements: list[tuple[dict, str, str]] = []
     rejected: list[dict] = []
     quarantine: list[dict] = []
 
-    def reject(rid, rtype, reason, detail, raw, key=None):
-        side = ("INTERNAL" if rtype == "event" else "PARTNER") if key else None
-        rejected.append(
-            dict(
-                bronze_record_id=rid,
-                record_type=rtype,
-                reason=reason,
-                detail=detail[:500],
-                match_key=key,
-                side=side,
-                raw=raw,
-            )
-        )
-
-    def quarantine_(rid, rtype, reason, detail, raw):
-        quarantine.append(
-            dict(
-                bronze_record_id=rid, record_type=rtype, reason=reason, detail=detail[:500], raw=raw
-            )
-        )
-
     for rid, rtype, fmt, raw in rows:
-        if rtype == "event":
-            try:
-                ev = PaymentEvent.model_validate_json(raw)
-                events[ev.event_id].append((ev, rid))
-            except ValidationError as exc:
-                if _is_malformed(exc):
-                    quarantine_(rid, rtype, "MALFORMED_JSON", _err(exc), raw)
-                else:
-                    try:
-                        key = _best_effort_key(json.loads(raw), rtype)
-                    except ValueError:
-                        key = None
-                    reject(rid, rtype, "SCHEMA_VALIDATION", _err(exc), raw, key)
-            continue
-
-        # statements: csv line or canonical json row
-        try:
-            if fmt == "csv":
-                cells = next(csv.reader([raw]))
-                if len(cells) != len(STMT_COLS):
-                    quarantine_(
-                        rid,
-                        rtype,
-                        "MALFORMED_CSV",
-                        f"{len(cells)} columns, expected {len(STMT_COLS)}",
-                        raw,
-                    )
-                    continue
-                obj = dict(zip(STMT_COLS, cells, strict=True))
-            else:
-                obj = json.loads(raw)
-                if not isinstance(obj, dict):
-                    quarantine_(rid, rtype, "MALFORMED_JSON", "row is not an object", raw)
-                    continue
-        except (ValueError, csv.Error, StopIteration) as exc:
-            quarantine_(rid, rtype, "MALFORMED_" + fmt.upper(), str(exc), raw)
-            continue
-        try:
-            statements.append((StatementRow.model_validate(obj), rid))
-        except ValidationError as exc:
-            reject(rid, rtype, "SCHEMA_VALIDATION", _err(exc), raw, _best_effort_key(obj, rtype))
+        p = parse_record(rtype, fmt, raw)
+        if p["outcome"] == "event":
+            events[p["event_id"]].append((p, rid, raw))
+        elif p["outcome"] == "statement":
+            statements.append((p, rid, raw))
+        elif p["outcome"] == "rejected":
+            rejected.append(
+                dict(
+                    bronze_record_id=rid,
+                    record_type=rtype,
+                    reason=p["reason"],
+                    detail=p["detail"],
+                    match_key=p["match_key"],
+                    side=p["side"],
+                    raw=raw,
+                )  # fmt: skip
+            )
+        else:
+            quarantine.append(
+                dict(
+                    bronze_record_id=rid,
+                    record_type=rtype,
+                    reason=p["reason"],
+                    detail=p["detail"],
+                    raw=raw,
+                )  # fmt: skip
+            )
 
     # ---- events: dedupe identical content, reject conflicting duplicates of an event_id ----
     ev_rows: list[dict] = []
     dups: list[dict] = []
     for eid in sorted(events):
         versions = events[eid]
-        if len({e.content_signature() for e, _ in versions}) > 1:
-            for e, rid in versions:
-                reject(
-                    rid,
-                    "event",
-                    "CONFLICTING_EVENT_ID",
-                    f"event_id {eid} seen with {len(versions)} differing versions",
-                    e.model_dump_json(),
-                    e.match_key,
+        if len({v[0]["sig"] for v in versions}) > 1:
+            for p, rid, raw in versions:
+                key = p["match_key"]
+                rejected.append(
+                    dict(
+                        bronze_record_id=rid,
+                        record_type="event",
+                        reason="CONFLICTING_EVENT_ID",
+                        detail=f"event_id {eid} seen with {len(versions)} differing versions",
+                        match_key=key,
+                        side="INTERNAL" if key else None,
+                        raw=raw,
+                    )  # fmt: skip
                 )
             continue
-        keep, keep_rid = versions[0]
-        for _, rid in versions[1:]:
+        keep, keep_rid, _ = versions[0]
+        for _, rid, _ in versions[1:]:
             dups.append(
                 dict(
                     obs_type="EVENT",
                     natural_id=eid,
-                    match_key=keep.match_key,
+                    match_key=keep["match_key"],
                     bronze_record_id=rid,
                     duplicate_of=keep_rid,
-                )
+                )  # fmt: skip
             )
-        ev_rows.append(
-            dict(
-                event_id=keep.event_id,
-                event_type=keep.event_type,
-                payment_id=keep.payment_id,
-                event_time=to_naive_utc(keep.event_time),
-                ingested_at=to_naive_utc(keep.ingested_at),
-                provider=keep.provider,
-                provider_ref=keep.provider_ref,
-                match_key=keep.match_key,
-                amount_minor=keep.amount_minor,
-                currency=keep.currency,
-                corridor=keep.corridor,
-                dest_currency=keep.dest_currency,
-                dest_amount_minor=keep.dest_amount_minor,
-                schema_version=keep.schema_version,
-                source=keep.source,
-                bronze_record_id=keep_rid,
-            )
-        )
+        ev_rows.append({**{c: keep[c] for c in EVENT_COLS}, "bronze_record_id": keep_rid})
 
     # ---- statements: dedupe rows with identical business content ----
     st_rows: list[dict] = []
-    seen: dict[tuple, str] = {}
-    for s, rid in statements:
-        sig = (
-            s.statement_row_id,
-            s.match_key,
-            s.amount_minor,
-            s.currency,
-            s.status,
-            to_naive_utc(s.settled_at),
-        )
-        if sig in seen:
+    seen: dict[str, str] = {}
+    for p, rid, _ in statements:
+        if p["sig"] in seen:
             dups.append(
                 dict(
                     obs_type="STATEMENT",
-                    natural_id=s.statement_row_id,
-                    match_key=s.match_key,
+                    natural_id=p["statement_row_id"],
+                    match_key=p["match_key"],
                     bronze_record_id=rid,
-                    duplicate_of=seen[sig],
-                )
+                    duplicate_of=seen[p["sig"]],
+                )  # fmt: skip
             )
             continue
-        seen[sig] = rid
-        st_rows.append(
-            dict(
-                statement_row_id=s.statement_row_id,
-                provider=s.provider.strip().upper(),
-                external_ref=s.external_ref,
-                match_key=s.match_key,
-                amount_minor=s.amount_minor,
-                currency=s.currency,
-                status=s.status,
-                settled_at=to_naive_utc(s.settled_at),
-                bronze_record_id=rid,
-            )
-        )
+        seen[p["sig"]] = rid
+        st_rows.append({**{c: p[c] for c in STMT_OUT_COLS}, "bronze_record_id": rid})
 
     ev_rows.sort(key=lambda r: (r["event_time"], r["event_id"]))
     st_rows.sort(key=lambda r: (r["settled_at"], r["statement_row_id"], r["bronze_record_id"]))
@@ -292,7 +192,4 @@ def build_silver(bronze_files: list[Path], silver_dir: Path) -> dict:
     }
     for name, t in tables.items():
         write_table(silver_dir / f"{name}.parquet", t)
-    return {
-        "bronze_records": len(rows),
-        **{name: t.num_rows for name, t in tables.items()},
-    }
+    return {"bronze_records": len(rows), **{name: t.num_rows for name, t in tables.items()}}

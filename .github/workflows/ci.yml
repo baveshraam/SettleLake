@@ -45,6 +45,7 @@ jobs:
           python -c "from settlelake.observability.tracking import Tracker; from settlelake.config import get_paths; t = Tracker(get_paths(None).meta_db); open('run_id.txt','w').write(t.latest_run('pipeline','COMPLETED')['run_id'])"
           settlelake replay --run-id $(cat run_id.txt)
         shell: bash
+
   package-install:
     name: clean wheel install
     runs-on: ubuntu-latest
@@ -59,12 +60,48 @@ jobs:
           python -m build --wheel
           python -m venv /tmp/clean && /tmp/clean/bin/pip install dist/*.whl
           cd /tmp && SETTLELAKE_HOME=/tmp/sl /tmp/clean/bin/settlelake generate --profile quick && SETTLELAKE_HOME=/tmp/sl /tmp/clean/bin/settlelake run
+
+  spark:
+    name: spark + iceberg (parity with DuckDB engine)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: python -m pip install -e ".[dev,stream]" apache-airflow==2.10.5 --constraint https://raw.githubusercontent.com/apache/airflow/constraints-2.10.5/constraints-3.11.txt
+      - run: bash scripts/install_spark_jars.sh
+      - run: pytest tests/spark tests/unit/test_airflow_dags.py -v
+
+  terraform:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: infra/terraform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+      - run: terraform fmt -check -recursive
+      - run: terraform init -backend=false -input=false
+      - run: terraform validate
+
   docker:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - run: docker compose config --quiet
+      - run: docker compose --profile stream --profile airflow config --quiet
       - run: docker compose build
       - name: Run pipeline service (QUICK) and start dashboard
         run: |
@@ -83,3 +120,31 @@ jobs:
       - name: Cleanup
         if: always()
         run: docker compose down -v
+
+  stream-e2e:
+    name: streaming e2e (Postgres, Debezium, Redpanda, Spark, Iceberg)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/e2e_stream.sh
+      - name: Logs on failure
+        if: failure()
+        run: docker compose --profile stream logs --tail=200
+      - name: Cleanup
+        if: always()
+        run: docker compose --profile stream down -v
+
+  airflow-e2e:
+    name: airflow backfill e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/e2e_airflow.sh
+      - name: Logs on failure
+        if: failure()
+        run: docker compose --profile airflow logs --tail=200
+      - name: Cleanup
+        if: always()
+        run: docker compose --profile airflow down -v

@@ -171,6 +171,8 @@ def generate(paths: Paths, cfg: GenConfig) -> dict:
         t_settled = t_cleared + timedelta(seconds=rng.randint(2 * H, 30 * H))
         t_delivered = t_settled + timedelta(seconds=rng.randint(600, 6 * H))
         corridor = f"{src}-{dst}"
+        # contract 1.1 (adds `channel`) is emitted for 30% of payments; the rest stay on 1.0
+        channel = ("api", "bank", "card")[i % 3] if i % 10 < 3 else None
         scenario = scenario_of.get(i, "CLEAN")
         ref = f"{provider[:3]}-REF-{i:08d}"
         reuse_amb = False
@@ -191,7 +193,7 @@ def generate(paths: Paths, cfg: GenConfig) -> dict:
                 "payment_id": pid,
                 "event_time": _ts(t),
                 "ingested_at": _ts(ingested),
-                "schema_version": "1.0",
+                "schema_version": "1.1" if channel else "1.0",
                 "source": SOURCE,
                 "provider": provider,
                 "provider_ref": ref if with_ref else None,
@@ -201,6 +203,8 @@ def generate(paths: Paths, cfg: GenConfig) -> dict:
                 "dest_currency": None,
                 "dest_amount_minor": None,
             }
+            if channel:
+                d["channel"] = channel
             d.update(extra or {})
             return d
 
