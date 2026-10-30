@@ -1,31 +1,85 @@
 name: ci
 on:
   push:
-    branches: [main]
+    branches: [main, "feat/**"]
   pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  python:
+    name: python ${{ matrix.python-version }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        os: [ubuntu-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+        include:
+          - os: windows-latest
+            python-version: "3.13"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - run: pip install -e ".[dev]"
+          cache-dependency-path: pyproject.toml
+      - run: python -m pip install -e ".[dev]"
       - run: ruff check src tests
       - run: ruff format --check src tests
       - run: pytest --cov=settlelake --cov-report=term-missing
-      - name: Quick end-to-end demo
+      - name: CLI and QUICK end-to-end smoke test
+        env:
+          SETTLELAKE_HOME: ${{ runner.temp }}/settlelake
         run: |
+          settlelake --help
           settlelake generate --profile quick --seed 42
           settlelake run
+          settlelake quality
           settlelake report
-  docker:
+          python -c "from settlelake.observability.tracking import Tracker; from settlelake.config import get_paths; t = Tracker(get_paths(None).meta_db); open('run_id.txt','w').write(t.latest_run('pipeline','COMPLETED')['run_id'])"
+          settlelake replay --run-id $(cat run_id.txt)
+        shell: bash
+  package-install:
+    name: clean wheel install
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t settlelake .
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: |
+          python -m pip install build
+          python -m build --wheel
+          python -m venv /tmp/clean && /tmp/clean/bin/pip install dist/*.whl
+          cd /tmp && SETTLELAKE_HOME=/tmp/sl /tmp/clean/bin/settlelake generate --profile quick && SETTLELAKE_HOME=/tmp/sl /tmp/clean/bin/settlelake run
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose config --quiet
+      - run: docker compose build
+      - name: Run pipeline service (QUICK) and start dashboard
+        run: |
+          docker compose up -d --wait --wait-timeout 120 dashboard
+          curl -fsS http://localhost:8501/_stcore/health
+          docker compose logs pipeline | tee pipeline.log
+          grep -q "COMPLETED" pipeline.log
+          docker compose exec -T dashboard sh -c 'ls /data/lake/gold/reconciliation.parquet && id -u'
+      - name: Data persists across container restart
+        run: |
+          docker compose restart dashboard
+          docker compose exec -T dashboard ls /data/lake/gold/reconciliation.parquet
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs
+      - name: Cleanup
+        if: always()
+        run: docker compose down -v
