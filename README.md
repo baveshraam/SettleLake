@@ -30,6 +30,14 @@ settlelake dashboard                                   # http://localhost:8501
 
 Data lives under `./data` (override with `--home` or `SETTLELAKE_HOME`); it is git-ignored.
 
+## Docker
+
+```bash
+docker compose up --build dashboard   # runs the QUICK pipeline into a volume, then serves http://localhost:8501
+```
+
+The image runs as a non-root user with data in the `/data` volume. This flow is smoke-tested in CI (`docker` job).
+
 ## Commands
 
 | command | purpose |
