@@ -10,9 +10,9 @@ RUN pip install --no-cache-dir pyspark==3.5.3
 ARG MVN=https://repo1.maven.org/maven2
 RUN J=$(python -c "import pyspark,os;print(os.path.join(os.path.dirname(pyspark.__file__),'jars'))") \
     && cd $J \
-    && curl -fsSLO $MVN/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.6.1/iceberg-spark-runtime-3.5_2.12-1.6.1.jar \
-    && curl -fsSLO $MVN/org/apache/iceberg/iceberg-aws-bundle/1.6.1/iceberg-aws-bundle-1.6.1.jar \
-    && curl -fsSLO $MVN/org/postgresql/postgresql/42.7.4/postgresql-42.7.4.jar
+    && curl -fsSLO --retry 5 --retry-all-errors $MVN/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.6.1/iceberg-spark-runtime-3.5_2.12-1.6.1.jar \
+    && curl -fsSLO --retry 5 --retry-all-errors $MVN/org/apache/iceberg/iceberg-aws-bundle/1.6.1/iceberg-aws-bundle-1.6.1.jar \
+    && curl -fsSLO --retry 5 --retry-all-errors $MVN/org/postgresql/postgresql/42.7.4/postgresql-42.7.4.jar
 WORKDIR /opt/settlelake
 COPY --chown=airflow:root pyproject.toml README.md ./
 COPY --chown=airflow:root src ./src

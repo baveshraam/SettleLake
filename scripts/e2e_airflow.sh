@@ -24,9 +24,9 @@ $AF python -c "
 from airflow.models import DagBag
 b = DagBag('/opt/airflow/dags', include_examples=False)
 assert not b.import_errors, b.import_errors
-d = b.get_dag('settlelake_daily_batch')
+d = b.dags['settlelake_daily_batch']
 assert d.catchup and [t.task_id for t in d.topological_sort()] == ['ingest_statements', 'build_silver_reconcile_gold', 'data_quality']
-assert b.get_dag('settlelake_event_replay').schedule_interval is None
+assert b.dags['settlelake_event_replay'].schedule_interval is None
 print('dags ok')
 "
 

@@ -31,6 +31,7 @@ def build_spark(app: str = "settlelake", **overrides: str) -> SparkSession:
         .config("spark.sql.session.timeZone", "UTC")
         .config("spark.sql.shuffle.partitions", os.environ.get("SPARK_SHUFFLE_PARTITIONS", "8"))
         .config("spark.ui.enabled", "false")
+        .config("spark.driver.memory", os.environ.get("SPARK_DRIVER_MEMORY", "2g"))
     )
     cfg = f"spark.sql.catalog.{CATALOG}"
     if kind == "local":

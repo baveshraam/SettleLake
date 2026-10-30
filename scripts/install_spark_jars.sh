@@ -12,6 +12,6 @@ for u in \
   org/apache/kafka/kafka-clients/3.4.1/kafka-clients-3.4.1.jar \
   org/apache/commons/commons-pool2/2.11.1/commons-pool2-2.11.1.jar \
   org/postgresql/postgresql/42.7.4/postgresql-42.7.4.jar; do
-  [ -f "$(basename "$u")" ] || curl -fsSLO "$MVN/$u"
+  [ -f "$(basename "$u")" ] || curl -fsSLO --retry 5 --retry-all-errors "$MVN/$u"
 done
 echo "jars installed in $J"
