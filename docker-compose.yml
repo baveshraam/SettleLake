@@ -1,0 +1,21 @@
+services:
+  pipeline:
+    build: .
+    command: sh -c "settlelake generate --profile quick --seed 42 && settlelake run && settlelake report"
+    environment:
+      SETTLELAKE_HOME: /data
+    volumes:
+      - settlelake-data:/data
+  dashboard:
+    build: .
+    depends_on:
+      pipeline:
+        condition: service_completed_successfully
+    ports:
+      - "8501:8501"
+    environment:
+      SETTLELAKE_HOME: /data
+    volumes:
+      - settlelake-data:/data
+volumes:
+  settlelake-data:
