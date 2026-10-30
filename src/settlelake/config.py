@@ -68,6 +68,14 @@ ANOMALY_LEVELS = ["clean", "low", "stress"]
 # A partner settlement later than this after the internal settlement is DELAYED_SETTLEMENT.
 DELAY_SLA_HOURS = 48
 
+# Fallback matching of rows whose references differ: max Levenshtein distance between normalised
+# references (0 disables it) and max |partner settled_at - internal event_time|. Values chosen on the
+# development seeds only (see docs/evaluation.md).
+FALLBACK_MAX_EDIT = 1
+FALLBACK_WINDOW_HOURS = 24
+# 1 = a unique mutual fuzzy candidate is matched automatically; 0 = it is only suggested (AMBIGUOUS_MATCH).
+FALLBACK_AUTO = 0
+
 # Reconciliation classification precedence (first match becomes the primary class).
 PRECEDENCE = [
     "INVALID_RECORD",

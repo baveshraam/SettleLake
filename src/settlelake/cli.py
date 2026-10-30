@@ -7,6 +7,7 @@ Exit codes: 0 success, 1 runtime/pipeline failure, 2 usage error, 3 quality ERRO
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -106,6 +107,66 @@ def cmd_benchmark(a) -> int:
     return 0 if r["idempotency"]["consistent"] else 4
 
 
+def cmd_evaluate(a) -> int:
+    from settlelake.observability import reconcile_eval as E
+
+    paths = get_paths(a.home)
+    paths.reports.mkdir(parents=True, exist_ok=True)
+    for split, seeds in (("dev", E.DEV_SEEDS), ("heldout", E.HELDOUT_SEEDS)):
+        if a.split not in (split, "both"):
+            continue
+        prepared = E.prepare(a.home, split, seeds, a.payments)
+        try:
+            sweep = E.run_sweep(prepared) if (a.sweep and split == "dev") else None
+            res = E.evaluate_params(
+                prepared
+            )  # frozen engine defaults from config.py, never tuned here
+            meta = {"split": split, "seeds": seeds, "payments_per_seed": a.payments}
+            (paths.reports / f"evaluation_{split}.json").write_text(
+                json.dumps({"meta": meta, "result": res, "sweep": sweep}, indent=2, default=str),
+                encoding="utf-8",
+            )
+            (paths.reports / f"evaluation_{split}.md").write_text(
+                E.to_markdown(f"Reconciliation evaluation: {split} seeds", res, sweep, meta),
+                encoding="utf-8",
+            )
+            m = res["automatic_matching"]
+            print(f"[{split}] precision={m['precision']} false_auto={m['false_automatic_matches']} "
+                  f"recall_true_pairs={m['recall_of_all_true_pairs']} params={res['params']}")  # fmt: skip
+            if sweep:
+                print(f"[dev] sweep selected: {sweep['selected']}")
+        finally:
+            E.cleanup(prepared)
+    return 0
+
+
+def cmd_suite(a) -> int:
+    from settlelake.observability.suite import run_suite
+
+    sizes = [int(x) for x in a.sizes.split(",")]
+    duck = dict(zip(sizes, (int(x) for x in a.duck_trials.split(",")), strict=True))
+    spark = dict(zip(sizes, (int(x) for x in a.spark_trials.split(",")), strict=True))
+    r = run_suite(a.home, sizes, duck, spark, a.seed, a.anomalies)
+    for size, e in r["sizes"].items():
+        d = e["duckdb"]
+        print(f"{size} payments: duckdb median {d['wall_seconds']['median']}s "
+              f"({d['payments_per_second']} payments/s, {d['records_per_second']} records/s)")  # fmt: skip
+    print(f"report: {get_paths(a.home).reports / (r['run_id'] + '.md')}")
+    return 0
+
+
+def cmd_reliability(a) -> int:
+    from settlelake.observability.reliability import run_reliability
+
+    r = run_reliability(a.home, a.payments, a.seed, a.anomalies)
+    bad = [x for x in r["failure_injection_recovery"] if not x["outputs_identical_to_clean_run"]]
+    print(f"reliability: completeness={r['source_record_completeness']['bronze_completeness']} "
+          f"replay={r['replay']['result']} recoveries_ok={len(r['failure_injection_recovery']) - len(bad)}/"
+          f"{len(r['failure_injection_recovery'])}")  # fmt: skip
+    print(f"report: {get_paths(a.home).reports / 'reliability.md'}")
+    return 0 if not bad and r["replay"]["result"] == "CONSISTENT" else 4
+
+
 def cmd_dashboard(a) -> int:
     app = Path(__file__).parent / "dashboard" / "app.py"
     env_home = str(get_paths(a.home).home)
@@ -156,6 +217,34 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--seed", type=int, default=42)
     b.add_argument("--anomalies", choices=ANOMALY_LEVELS, default="low")
     b.set_defaults(fn=cmd_benchmark)
+
+    su = sub.add_parser(
+        "benchmark-suite", help="multi-size, multi-trial benchmark (Spark runs only if available)"
+    )
+    su.add_argument("--sizes", default="10000,100000")
+    su.add_argument("--duck-trials", default="5,3")
+    su.add_argument("--spark-trials", default="0,0")
+    su.add_argument("--seed", type=int, default=42)
+    su.add_argument("--anomalies", choices=ANOMALY_LEVELS, default="low")
+    su.set_defaults(fn=cmd_suite)
+
+    rl = sub.add_parser(
+        "reliability", help="failure-injection and reliability scenarios with measured metrics"
+    )
+    rl.add_argument("--payments", type=int, default=10000)
+    rl.add_argument("--seed", type=int, default=42)
+    rl.add_argument("--anomalies", choices=ANOMALY_LEVELS, default="low")
+    rl.set_defaults(fn=cmd_reliability)
+
+    ev = sub.add_parser(
+        "evaluate", help="adversarial reconciliation evaluation (dev / held-out seeds)"
+    )
+    ev.add_argument("--split", choices=["dev", "heldout", "both"], default="both")
+    ev.add_argument(
+        "--sweep", action="store_true", help="dev only: policy sweep with the pre-registered rule"
+    )
+    ev.add_argument("--payments", type=int, default=5000, help="payments per seed")
+    ev.set_defaults(fn=cmd_evaluate)
 
     d = sub.add_parser("dashboard", help="launch the Streamlit dashboard")
     d.add_argument("--port", type=int, default=8501)

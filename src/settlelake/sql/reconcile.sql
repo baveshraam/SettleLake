@@ -7,9 +7,57 @@ WITH i AS (
     FROM read_parquet('{silver}/events.parquet')
     WHERE event_type = 'funds.settled'
 ),
-p AS (
-    SELECT match_key, statement_row_id, amount_minor, currency, status, settled_at
+p0 AS (
+    SELECT match_key, statement_row_id, external_ref, amount_minor, currency, status, settled_at
     FROM read_parquet('{silver}/statements.parquet')
+),
+ikeys AS (SELECT match_key, count(*) AS n FROM i GROUP BY match_key),
+pkeys AS (SELECT match_key, count(*) AS n FROM p0 GROUP BY match_key),
+rej AS (SELECT DISTINCT match_key FROM read_parquet('{silver}/rejected.parquet') WHERE match_key IS NOT NULL),
+-- Fallback matching: internal and partner rows whose reference keys do NOT match exactly may still
+-- be paired when provider, currency and amount are equal, settlement times are within the window and
+-- the references are within a small edit distance. The pair must be unique on BOTH sides; otherwise
+-- every involved row abstains (AMBIGUOUS_MATCH). No ground truth is consulted.
+ui AS (
+    SELECT i.match_key, i.currency, i.amount_minor, i.event_time,
+           split_part(i.match_key, '|', 1) AS prov, split_part(i.match_key, '|', 2) AS ref
+    FROM i JOIN ikeys ON ikeys.match_key = i.match_key AND ikeys.n = 1
+    LEFT JOIN pkeys pk ON pk.match_key = i.match_key
+    LEFT JOIN rej r ON r.match_key = i.match_key
+    WHERE pk.match_key IS NULL AND r.match_key IS NULL
+),
+up AS (
+    SELECT p0.match_key, p0.statement_row_id, p0.currency, p0.amount_minor, p0.settled_at,
+           split_part(p0.match_key, '|', 1) AS prov, split_part(p0.match_key, '|', 2) AS ref
+    FROM p0 JOIN pkeys ON pkeys.match_key = p0.match_key AND pkeys.n = 1
+    LEFT JOIN ikeys ik ON ik.match_key = p0.match_key
+    LEFT JOIN rej r ON r.match_key = p0.match_key
+    WHERE ik.match_key IS NULL AND r.match_key IS NULL
+),
+cand AS (
+    SELECT ui.match_key AS ik, up.match_key AS pk, up.statement_row_id
+    FROM ui JOIN up ON ui.prov = up.prov AND ui.currency = up.currency
+         AND ui.amount_minor = up.amount_minor
+         AND abs(date_diff('second', ui.event_time, up.settled_at)) <= {fb_window_seconds}
+         AND levenshtein(ui.ref, up.ref) <= {fb_max_edit}
+),
+cand_i AS (SELECT ik, count(*) AS c FROM cand GROUP BY ik),
+cand_p AS (SELECT pk, count(*) AS c FROM cand GROUP BY pk),
+edges AS (
+    SELECT cand.ik, cand.pk, cand.statement_row_id, (ci.c = 1 AND cp.c = 1 AND {fb_auto} = 1) AS accepted,
+           ci.c AS ci, cp.c AS cp
+    FROM cand JOIN cand_i ci ON ci.ik = cand.ik JOIN cand_p cp ON cp.pk = cand.pk
+),
+fb_amb AS (
+    SELECT ik AS match_key, max(ci) AS n FROM edges WHERE NOT accepted GROUP BY ik
+    UNION ALL
+    SELECT pk AS match_key, max(cp) AS n FROM edges WHERE NOT accepted GROUP BY pk
+),
+p AS (
+    SELECT coalesce(e.ik, p0.match_key) AS match_key, p0.statement_row_id, p0.external_ref,
+           p0.amount_minor, p0.currency, p0.status, p0.settled_at, (e.ik IS NOT NULL) AS via_fb
+    FROM p0 LEFT JOIN edges e
+      ON e.pk = p0.match_key AND e.statement_row_id = p0.statement_row_id AND e.accepted
 ),
 ia AS (
     SELECT match_key, count(*) AS n_i, list(event_id ORDER BY event_id) AS i_refs,
@@ -21,7 +69,8 @@ ia AS (
 pa AS (
     SELECT match_key, count(*) AS n_p, list(statement_row_id ORDER BY statement_row_id) AS p_refs,
            min(amount_minor) AS p_amt, min(currency) AS p_cur, min(status) AS p_status,
-           min(settled_at) AS p_time
+           min(settled_at) AS p_time,
+           coalesce(bool_or(via_fb), false) AS via_fb, min(external_ref) AS p_ext
     FROM p GROUP BY match_key
 ),
 inv AS (
@@ -47,6 +96,7 @@ base AS (
     SELECT k.match_key,
            coalesce(ia.n_i, 0) AS n_i, coalesce(pa.n_p, 0) AS n_p,
            coalesce(inv.inv_i, false) AS inv_i, coalesce(inv.inv_p, false) AS inv_p,
+           coalesce(fb_amb.n, 0) AS fb_n, coalesce(pa.via_fb, false) AS via_fb, pa.p_ext,
            coalesce(dup.d_e, 0) AS d_e, coalesce(dup.d_s, 0) AS d_s,
            coalesce(ia.i_refs, []::VARCHAR[]) AS i_refs, coalesce(pa.p_refs, []::VARCHAR[]) AS p_refs,
            ia.payment_id, ia.corridor, ia.i_amt, ia.i_cur, ia.i_time, ia.i_ingested,
@@ -54,6 +104,7 @@ base AS (
     FROM keys k
     LEFT JOIN ia USING (match_key) LEFT JOIN pa USING (match_key)
     LEFT JOIN inv USING (match_key) LEFT JOIN dup USING (match_key)
+    LEFT JOIN (SELECT match_key, max(n) AS n FROM fb_amb GROUP BY match_key) fb_amb USING (match_key)
 ),
 flagged AS (
     SELECT *, (n_i = 1 AND n_p = 1) AS one_to_one FROM base
@@ -61,7 +112,7 @@ flagged AS (
 found AS (
     SELECT *, list_filter([
         CASE WHEN inv_i OR inv_p THEN 'INVALID_RECORD' END,
-        CASE WHEN n_i > 1 OR n_p > 1 THEN 'AMBIGUOUS_MATCH' END,
+        CASE WHEN n_i > 1 OR n_p > 1 OR fb_n > 0 THEN 'AMBIGUOUS_MATCH' END,
         CASE WHEN n_i = 0 AND NOT inv_i THEN 'MISSING_INTERNAL_RECORD' END,
         CASE WHEN n_p = 0 AND NOT inv_p THEN 'MISSING_PARTNER_RECORD' END,
         CASE WHEN one_to_one AND i_cur <> p_cur THEN 'CURRENCY_MISMATCH' END,
@@ -98,15 +149,18 @@ SELECT
     CASE WHEN n_p = 1 THEN p_time END AS partner_settled_at,
     CASE WHEN one_to_one THEN date_diff('second', i_time, p_time) END AS settlement_lag_seconds,
     CASE WHEN n_i = 1 THEN date_diff('second', i_time, i_ingested) END AS ingestion_lag_seconds,
+    CASE WHEN via_fb THEN 'FALLBACK' ELSE 'KEY' END AS match_method,
+    fb_n AS fallback_candidates,
     CASE WHEN len(reasons) = 0
-         THEN 'Internal settlement and partner statement agree on amount, currency and status.'
+         THEN CASE WHEN via_fb THEN 'Matched by fallback (equal provider, currency and amount, settled within the window); partner reference ' || p_ext || ' differs from the internal reference.'
+                ELSE 'Internal settlement and partner statement agree on amount, currency and status.' END
          ELSE concat_ws('; ',
             CASE WHEN list_contains(reasons, 'INVALID_RECORD') THEN
                 'invalid source record(s) quarantined for this key (internal='
                 || inv_i::VARCHAR || ', partner=' || inv_p::VARCHAR || ')' END,
             CASE WHEN list_contains(reasons, 'AMBIGUOUS_MATCH') THEN
-                n_i::VARCHAR || ' internal and ' || n_p::VARCHAR
-                || ' partner records share this key; not forced into a match' END,
+                CASE WHEN fb_n > 0 THEN fb_n::VARCHAR || ' fuzzy-reference candidate counterpart(s) with equal provider, currency and amount; not forced into a match'
+                     ELSE n_i::VARCHAR || ' internal and ' || n_p::VARCHAR || ' partner records share this key; not forced into a match' END END,
             CASE WHEN list_contains(reasons, 'MISSING_INTERNAL_RECORD') THEN
                 'partner statement has no internal settlement for this reference' END,
             CASE WHEN list_contains(reasons, 'MISSING_PARTNER_RECORD') THEN

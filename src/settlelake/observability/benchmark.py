@@ -11,6 +11,7 @@ import platform
 import shutil
 import sys
 import time
+import uuid
 from datetime import UTC, datetime
 
 import duckdb
@@ -119,8 +120,11 @@ def _settlement_totals(paths: Paths) -> dict[str, tuple[int, int]]:
 
 def run_benchmark(home, payments: int, seed: int = 42, anomalies: str = "low") -> dict:
     base = get_paths(home)
-    work = Paths(base.home / "benchmarks" / f"n{payments}_s{seed}_{anomalies}")
-    shutil.rmtree(work.home, ignore_errors=True)  # our own scratch workspace, recreated each run
+    # unique directory per run: a previous (or interrupted) run can never collide with this one
+    work = Paths(
+        base.home / "benchmarks" / f"n{payments}_s{seed}_{anomalies}_{uuid.uuid4().hex[:8]}"
+    )
+    work.home.mkdir(parents=True, exist_ok=False)
 
     t = time.perf_counter()
     manifest = generate(work, GenConfig(payments, seed, anomalies))
@@ -223,6 +227,7 @@ def run_benchmark(home, payments: int, seed: int = 42, anomalies: str = "low") -
         json.dumps(result, indent=2, default=str) + "\n", encoding="utf-8", newline="\n"
     )
     (base.reports / "benchmark.md").write_text(to_markdown(result), encoding="utf-8", newline="\n")
+    shutil.rmtree(work.home, ignore_errors=True)  # scratch data only; reports are kept
     return result
 
 

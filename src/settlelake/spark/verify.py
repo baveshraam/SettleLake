@@ -12,7 +12,8 @@ from settlelake.spark.session import build_spark
 COLS = (
     "match_key, classification, reasons, internal_amount_minor, internal_currency, "
     "partner_amount_minor, partner_currency, partner_status, settlement_lag_seconds, "
-    "ingestion_lag_seconds, explanation, payment_id, corridor, internal_refs, partner_refs"
+    "ingestion_lag_seconds, explanation, payment_id, corridor, internal_refs, partner_refs, "
+    "match_method, fallback_candidates"
 )
 
 
@@ -20,19 +21,16 @@ def _norm(rows):
     return [tuple(list(v) if isinstance(v, (list, tuple)) else v for v in r) for r in rows]
 
 
-def verify_parity(home: Path) -> dict:
-    paths = get_paths(home)
-    spark = build_spark("settlelake-verify")
+def compare_with_duckdb(spark, duck_gold: Path, table: str | None = None) -> dict:
+    """Compare Iceberg gold.reconciliation (all COLS) with the DuckDB engine's Parquet output."""
+    table = table or t("gold", "reconciliation")
     got = _norm(
-        tuple(r)
-        for r in spark.sql(
-            f"SELECT {COLS} FROM {t('gold', 'reconciliation')} ORDER BY match_key"
-        ).collect()
+        tuple(r) for r in spark.sql(f"SELECT {COLS} FROM {table} ORDER BY match_key").collect()
     )
     con = connect()
     ref = _norm(
         con.execute(
-            f"SELECT {COLS} FROM read_parquet('{(paths.gold / 'reconciliation.parquet').as_posix()}') "
+            f"SELECT {COLS} FROM read_parquet('{(duck_gold / 'reconciliation.parquet').as_posix()}') "
             "ORDER BY match_key"
         ).fetchall()
     )
@@ -44,6 +42,10 @@ def verify_parity(home: Path) -> dict:
         "differing_keys": diff[:10],
         "identical": got == ref and len(ref) > 0,
     }
+
+
+def verify_parity(home: Path) -> dict:
+    return compare_with_duckdb(build_spark("settlelake-verify"), get_paths(home).gold)
 
 
 def bronze_stats(expected_events: int) -> dict:

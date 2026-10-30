@@ -12,11 +12,19 @@ import time
 from datetime import UTC, date, datetime
 from pathlib import Path
 
+from pyspark import StorageLevel
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
-from settlelake.config import CURRENCIES, DELAY_SLA_HOURS, PRECEDENCE
+from settlelake.config import (
+    CURRENCIES,
+    DELAY_SLA_HOURS,
+    FALLBACK_AUTO,
+    FALLBACK_MAX_EDIT,
+    FALLBACK_WINDOW_HOURS,
+    PRECEDENCE,
+)
 from settlelake.ingestion.bronze import _records, discover_inputs
 from settlelake.ingestion.parse import FIELDS, parse_record
 from settlelake.observability import lineage, metrics
@@ -130,7 +138,10 @@ def build_silver(spark: SparkSession) -> dict:
         "bronze_record_id", "record_type", "source_format",
         F.coalesce("source_file", F.lit("cdc")).alias("source_file"), "line_no", "raw",
     )  # fmt: skip
+    # The Python record parser is by far the most expensive step; _parsed feeds six outputs, so it
+    # must be materialised once (profiling showed it was re-evaluated once per output without this).
     parsed = spark.createDataFrame(src.rdd.mapPartitions(_parse_partition), PARSED_SCHEMA)
+    parsed.persist(StorageLevel.MEMORY_AND_DISK)
     parsed.createOrReplaceTempView("_parsed")
     w = "PARTITION BY event_id ORDER BY source_file, line_no"
     spark.sql(f"""
@@ -174,20 +185,34 @@ def build_silver(spark: SparkSession) -> dict:
         df = spark.sql(sql)
         df.writeTo(t("silver", name)).createOrReplace()
         counts[name] = spark.table(t("silver", name)).count()
+    parsed.unpersist()
     counts["bronze_records"] = (
         spark.table(BRONZE_EVENTS).count() + spark.table(BRONZE_STATEMENTS).count()
     )
     return counts
 
 
-def reconcile(spark: SparkSession, sla_hours: int = DELAY_SLA_HOURS) -> dict:
+def reconcile(
+    spark: SparkSession,
+    sla_hours: int = DELAY_SLA_HOURS,
+    fb_max_edit: int = FALLBACK_MAX_EDIT,
+    fb_window_hours: int = FALLBACK_WINDOW_HOURS,
+    fb_auto: int = FALLBACK_AUTO,
+    silver_ns: str = "silver",
+    out_table: str | None = None,
+) -> dict:
+    """Reconcile Silver tables in namespace `silver_ns` into `out_table` (default gold.reconciliation)."""
     sql = load_sql("reconcile_spark.sql").format(
-        events=t("silver", "events"), statements=t("silver", "statements"),
-        rejected=t("silver", "rejected"), duplicates=t("silver", "duplicates"),
-        sla_seconds=sla_hours * 3600, precedence=", ".join(f"'{c}'" for c in PRECEDENCE),
+        events=t(silver_ns, "events"), statements=t(silver_ns, "statements"),
+        rejected=t(silver_ns, "rejected"), duplicates=t(silver_ns, "duplicates"),
+        sla_seconds=sla_hours * 3600,
+        fb_max_edit=fb_max_edit,
+        fb_auto=fb_auto,
+        fb_window_seconds=fb_window_hours * 3600, precedence=", ".join(f"'{c}'" for c in PRECEDENCE),
     )  # fmt: skip
-    spark.sql(sql).writeTo(t("gold", "reconciliation")).createOrReplace()
-    r = spark.table(t("gold", "reconciliation"))
+    out_table = out_table or t("gold", "reconciliation")
+    spark.sql(sql).writeTo(out_table).createOrReplace()
+    r = spark.table(out_table)
     return {"reconciled_keys": r.count(), "matched": r.filter("classification = 'MATCHED'").count()}
 
 

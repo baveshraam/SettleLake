@@ -101,15 +101,26 @@ def cmd_sql(a) -> int:
 
 
 def cmd_bench(a) -> int:
-    from settlelake.spark.bench import run_engine_benchmark
+    from settlelake.observability.suite import run_suite
 
-    r = run_engine_benchmark(os.environ.get("SETTLELAKE_HOME"), a.payments, a.seed)
+    sizes = [int(x) for x in a.sizes.split(",")]
+    duck = dict(zip(sizes, (int(x) for x in a.duck_trials.split(",")), strict=True))
+    spark = dict(zip(sizes, (int(x) for x in a.spark_trials.split(",")), strict=True))
+    r = run_suite(os.environ.get("SETTLELAKE_HOME"), sizes, duck, spark, a.seed)
     print(
         json.dumps(
-            {k: r[k] for k in ("workload", "duckdb", "spark_local", "output_parity")}, default=str
+            {
+                k: {
+                    e: v.get(e, {}).get("wall_seconds", {}).get("median")
+                    for e in ("duckdb", "spark")
+                }
+                for k, v in r["sizes"].items()
+            },
+            default=str,
         )
     )
-    return 0 if r["output_parity"]["identical"] else 4
+    ok = all(v["spark"].get("parity_identical_all_trials", True) for v in r["sizes"].values())
+    return 0 if ok else 4
 
 
 def cmd_stream(a) -> int:
@@ -202,7 +213,9 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("query")
     q.set_defaults(fn=cmd_sql)
     bn = sub.add_parser("bench", help="DuckDB vs Spark(local) benchmark with output parity check")
-    bn.add_argument("--payments", type=int, default=10000)
+    bn.add_argument("--sizes", default="10000")
+    bn.add_argument("--duck-trials", default="3")
+    bn.add_argument("--spark-trials", default="3")
     bn.add_argument("--seed", type=int, default=42)
     bn.set_defaults(fn=cmd_bench)
     s = sub.add_parser("stream")
