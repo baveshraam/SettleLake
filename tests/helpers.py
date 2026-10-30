@@ -1,0 +1,71 @@
+"""Shared test builders (kept out of conftest.py so several conftest modules cannot shadow them)."""
+
+import json
+from pathlib import Path
+
+from settlelake.config import get_paths
+
+
+def settle_event(
+    eid,
+    ref,
+    amount=10_000,
+    cur="USD",
+    provider="ATLAS",
+    t="2026-01-05T10:00:00Z",
+    ingested="2026-01-05T10:00:30Z",
+    pid=None,
+    **over,
+):
+    d = {
+        "event_id": eid,
+        "event_type": "funds.settled",
+        "payment_id": pid or f"PAY-{eid}",
+        "event_time": t,
+        "ingested_at": ingested,
+        "schema_version": "1.0",
+        "source": "test",
+        "provider": provider,
+        "provider_ref": ref,
+        "amount_minor": amount,
+        "currency": cur,
+        "corridor": "USD-INR",
+        "dest_currency": None,
+        "dest_amount_minor": None,
+    }
+    d.update(over)
+    return d
+
+
+def stmt_row(
+    sid,
+    ref,
+    amount="100.00",
+    cur="USD",
+    status="SETTLED",
+    provider="ATLAS",
+    at="2026-01-05T12:00:00Z",
+    **over,
+):
+    d = {
+        "statement_row_id": sid,
+        "provider": provider,
+        "external_ref": ref,
+        "amount": amount,
+        "currency": cur,
+        "status": status,
+        "settled_at": at,
+    }
+    d.update(over)
+    return d
+
+
+def write_inputs(home: Path, events: list, stmts: list, raw_event_lines=()):
+    raw = get_paths(home).raw
+    raw.mkdir(parents=True, exist_ok=True)
+    lines = [json.dumps(e) for e in events] + list(raw_event_lines)
+    (raw / "payment_events.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    body = ",\n".join(json.dumps(r, sort_keys=True, separators=(",", ":")) for r in stmts)
+    (raw / "statements_ATLAS.json").write_text(
+        '{"provider":"ATLAS","rows":[\n' + body + "\n]}\n", encoding="utf-8"
+    )

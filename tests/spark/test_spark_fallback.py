@@ -55,6 +55,6 @@ def test_fallback_reconciliation_identical_across_engines(spark, eval_silver, pa
         ).collect()
     )
     assert len(ref) > 1000 and got == ref
-    methods = {r[-2] for r in ref}
+    methods = {r[-3] for r in ref}
     if params["fb_auto"] == 1 and params["fb_max_edit"] > 0:
         assert "FALLBACK" in methods  # the fallback path was really exercised

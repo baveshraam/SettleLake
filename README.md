@@ -19,6 +19,26 @@ Two engines implement the same business rules and are tested for **exact output 
 
 See [docs/architecture.md](docs/architecture.md) for the data-flow diagram and design decisions.
 
+## Results at a glance
+
+All figures are synthetic-data measurements; each links to its method. Spark runs in `local[*]` on one node (no cluster results).
+
+| area | verified result | source |
+|---|---|---|
+| Throughput (DuckDB, 100k payments / 489,572 records, Linux container, median of 3) | 20.5 s, 4,877 payments/s, 23,874 records/s | [benchmark-results §1](docs/benchmark-results.md) |
+| Throughput (DuckDB, Windows host, 500k payments, 1 trial) | 241 s, 2,075 payments/s, 10,153 records/s | [§2](docs/benchmark-results.md) |
+| DuckDB vs Spark(local), 100k | DuckDB 20.5 s vs Spark 108.6 s (1 Spark trial); Spark was slower at every size | [§1](docs/benchmark-results.md) |
+| Engine parity | Spark and DuckDB reconciliation tables identical (9,663 / 96,291 rows) | [§1](docs/benchmark-results.md), `tests/spark` |
+| Event-ingestion lag (generator property) | p50 31 s, p95 58 s, p99 60 s | [§3](docs/benchmark-results.md) |
+| Auto-matching precision (adversarial held-out seeds) | 98.35%; 182 false automatic matches of 11,024 (1.65%), all from the undetectable `WRONG_TARGET` scenario | [evaluation](docs/evaluation.md) |
+| Auto-matching coverage / automation (held-out) | 92.60% of resolvable pairs; 75.94% of internal records auto-paired | [evaluation](docs/evaluation.md) |
+| Ambiguity handling (held-out) | 676/676 competing-candidate records abstained (AMBIGUOUS_MATCH); fuzzy auto-matching disabled | [evaluation](docs/evaluation.md) |
+| Unresolved exposure (held-out, per currency) | exposure recall 94.8-97.1%; falsely cleared e.g. USD 3,403,427.31 (all from `WRONG_TARGET`); every currency reported separately | [evaluation](docs/evaluation.md) |
+| Failure recovery | crash at each of 5 stages then resume: 5/5 outputs identical to a clean run (0.9-4.8 s); replay hashes consistent; streaming crash-after-MERGE: 3,937/3,937 events exactly once (CI) | [reliability](docs/results/reliability.md), `scripts/e2e_stream.sh` |
+| Tests | 98 pytest tests pass (non-Spark line coverage 92.5%) + 15 Spark parity tests + streaming and Airflow e2e jobs in CI | [BUILD_STATUS](docs/BUILD_STATUS.md) |
+
+The first generator's "F1 = 1.0" agreement is a regression test, not a quality claim; see [evaluation](docs/evaluation.md).
+
 ## Quick start (local engine, no Docker)
 
 Requires Python 3.11+.
@@ -90,8 +110,9 @@ Actions on every push. Benchmarks and caveats: [docs/benchmark-results.md](docs/
   Bronze. This is not a general exactly-once claim.
 - **Recovery:** the local engine resumes at stage granularity; Spark streaming resumes from its checkpoint.
   Single-node Compose proves semantics, not horizontal scale-out; Spark runs in `local[*]` here.
-- **Reconciliation F1 = 1.0** against ground truth means the engine agrees with the synthetic labels, which are
-  designed to be unambiguous. It says nothing about real-world accuracy.
+- **Synthetic evaluation only.** Reconciliation precision/coverage are measured against generated labels. The reconciliation
+  rule is blind to a partner booking a payment under another payment's reference with an identical amount (182 false matches
+  in the held-out set); real accuracy is unknown.
 - Terraform does not provision Kafka/Redpanda, Debezium or Postgres. Streaming checkpoints need durable storage on
   AWS (not configured). No Prometheus/Grafana server is bundled; metrics are written in Prometheus text format.
 

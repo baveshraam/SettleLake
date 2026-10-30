@@ -48,10 +48,15 @@ edges AS (
            ci.c AS ci, cp.c AS cp
     FROM cand JOIN cand_i ci ON ci.ik = cand.ik JOIN cand_p cp ON cp.pk = cand.pk
 ),
-fb_amb AS (
-    SELECT ik AS match_key, max(ci) AS n FROM edges WHERE NOT accepted GROUP BY ik
+fb_amb AS (  -- competing candidates: genuinely ambiguous, never forced
+    SELECT ik AS match_key, max(ci) AS n FROM edges WHERE NOT (ci = 1 AND cp = 1) GROUP BY ik
     UNION ALL
-    SELECT pk AS match_key, max(cp) AS n FROM edges WHERE NOT accepted GROUP BY pk
+    SELECT pk AS match_key, max(cp) AS n FROM edges WHERE NOT (ci = 1 AND cp = 1) GROUP BY pk
+),
+fb_rev AS (  -- one unique mutual candidate that policy does not auto-accept: human review
+    SELECT ik AS match_key, pk AS other_key FROM edges WHERE ci = 1 AND cp = 1 AND NOT accepted
+    UNION ALL
+    SELECT pk AS match_key, ik AS other_key FROM edges WHERE ci = 1 AND cp = 1 AND NOT accepted
 ),
 p AS (
     SELECT coalesce(e.ik, p0.match_key) AS match_key, p0.statement_row_id, p0.external_ref,
@@ -96,7 +101,7 @@ base AS (
     SELECT k.match_key,
            coalesce(ia.n_i, 0) AS n_i, coalesce(pa.n_p, 0) AS n_p,
            coalesce(inv.inv_i, false) AS inv_i, coalesce(inv.inv_p, false) AS inv_p,
-           coalesce(fb_amb.n, 0) AS fb_n, coalesce(pa.via_fb, false) AS via_fb, pa.p_ext,
+           coalesce(fb_amb.n, 0) AS fb_n, fb_rev.other_key AS review_key, coalesce(pa.via_fb, false) AS via_fb, pa.p_ext,
            coalesce(dup.d_e, 0) AS d_e, coalesce(dup.d_s, 0) AS d_s,
            coalesce(ia.i_refs, []::VARCHAR[]) AS i_refs, coalesce(pa.p_refs, []::VARCHAR[]) AS p_refs,
            ia.payment_id, ia.corridor, ia.i_amt, ia.i_cur, ia.i_time, ia.i_ingested,
@@ -105,6 +110,7 @@ base AS (
     LEFT JOIN ia USING (match_key) LEFT JOIN pa USING (match_key)
     LEFT JOIN inv USING (match_key) LEFT JOIN dup USING (match_key)
     LEFT JOIN (SELECT match_key, max(n) AS n FROM fb_amb GROUP BY match_key) fb_amb USING (match_key)
+    LEFT JOIN (SELECT match_key, min(other_key) AS other_key FROM fb_rev GROUP BY match_key) fb_rev USING (match_key)
 ),
 flagged AS (
     SELECT *, (n_i = 1 AND n_p = 1) AS one_to_one FROM base
@@ -113,6 +119,7 @@ found AS (
     SELECT *, list_filter([
         CASE WHEN inv_i OR inv_p THEN 'INVALID_RECORD' END,
         CASE WHEN n_i > 1 OR n_p > 1 OR fb_n > 0 THEN 'AMBIGUOUS_MATCH' END,
+        CASE WHEN review_key IS NOT NULL THEN 'REVIEW_REQUIRED' END,
         CASE WHEN n_i = 0 AND NOT inv_i THEN 'MISSING_INTERNAL_RECORD' END,
         CASE WHEN n_p = 0 AND NOT inv_p THEN 'MISSING_PARTNER_RECORD' END,
         CASE WHEN one_to_one AND i_cur <> p_cur THEN 'CURRENCY_MISMATCH' END,
@@ -151,6 +158,7 @@ SELECT
     CASE WHEN n_i = 1 THEN date_diff('second', i_time, i_ingested) END AS ingestion_lag_seconds,
     CASE WHEN via_fb THEN 'FALLBACK' ELSE 'KEY' END AS match_method,
     fb_n AS fallback_candidates,
+    review_key AS review_candidate_key,
     CASE WHEN len(reasons) = 0
          THEN CASE WHEN via_fb THEN 'Matched by fallback (equal provider, currency and amount, settled within the window); partner reference ' || p_ext || ' differs from the internal reference.'
                 ELSE 'Internal settlement and partner statement agree on amount, currency and status.' END
@@ -161,6 +169,8 @@ SELECT
             CASE WHEN list_contains(reasons, 'AMBIGUOUS_MATCH') THEN
                 CASE WHEN fb_n > 0 THEN fb_n::VARCHAR || ' fuzzy-reference candidate counterpart(s) with equal provider, currency and amount; not forced into a match'
                      ELSE n_i::VARCHAR || ' internal and ' || n_p::VARCHAR || ' partner records share this key; not forced into a match' END END,
+            CASE WHEN list_contains(reasons, 'REVIEW_REQUIRED') THEN
+                'one unique fuzzy-reference candidate counterpart (' || review_key || ') with equal provider, currency and amount; not matched automatically, needs human review' END,
             CASE WHEN list_contains(reasons, 'MISSING_INTERNAL_RECORD') THEN
                 'partner statement has no internal settlement for this reference' END,
             CASE WHEN list_contains(reasons, 'MISSING_PARTNER_RECORD') THEN

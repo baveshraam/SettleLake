@@ -1,8 +1,8 @@
 import duckdb
 import pytest
-from conftest import settle_event as se
-from conftest import stmt_row as sr
-from conftest import write_inputs
+from helpers import settle_event as se
+from helpers import stmt_row as sr
+from helpers import write_inputs
 
 from settlelake.config import get_paths
 from settlelake.ingestion.bronze import IngestionError, discover_inputs

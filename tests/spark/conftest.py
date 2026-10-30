@@ -1,10 +1,12 @@
+import importlib.util
 import shutil
 
 import pytest
 
-pytest.importorskip("pyspark")
-if shutil.which("java") is None:
-    pytest.skip("Java runtime not available", allow_module_level=True)
+# Never call pytest.skip() at conftest import time: it aborts collection of every test directory that
+# sorts after this one (that silently dropped tests/unit from the run). Ignore the Spark tests instead.
+if importlib.util.find_spec("pyspark") is None or shutil.which("java") is None:
+    collect_ignore_glob = ["test_*.py"]
 
 from settlelake.config import get_paths  # noqa: E402
 from settlelake.pipeline import run_pipeline  # noqa: E402

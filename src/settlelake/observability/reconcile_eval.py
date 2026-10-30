@@ -3,6 +3,20 @@
 Truth comes from `simulator/evaluation.py` (written to a separate directory). The reconciliation
 engine never reads it. Every result is measured against controlled synthetic ground truth and says
 nothing about real-world accuracy.
+
+Metric definitions (all derived from ONE confusion matrix plus the automatic-pair sets, so every
+number in a report can be recomputed from the tables printed next to it):
+
+  unit            an internal settlement event, or a partner row that has no internal counterpart
+  true label      the category the generator assigned to the unit
+  predicted label the engine's primary classification of the reconciliation row holding the unit
+  per-class       support = row total, recall = diagonal / support,
+                  predicted = column total, precision = diagonal / predicted.
+                  Units whose true label is UNRESOLVED_PAIR are removed from the column totals of
+                  MISSING_* / REVIEW_REQUIRED / AMBIGUOUS_MATCH / INVALID_RECORD: flagging a pair the policy
+                  cannot safely resolve is the intended behaviour, not a false positive (reported separately).
+  automatic pair  a reconciliation row with exactly one internal and one partner record whose class is not
+                  AMBIGUOUS_MATCH / REVIEW_REQUIRED / INVALID_RECORD
 """
 
 from __future__ import annotations
@@ -27,11 +41,17 @@ from settlelake.simulator.evaluation import UNRESOLVED, EvalConfig, generate_eva
 
 DEV_SEEDS = [11, 12, 13]
 HELDOUT_SEEDS = [901, 902, 903]
-NOT_AUTO = {"AMBIGUOUS_MATCH", "INVALID_RECORD"}
+NOT_AUTO = {"AMBIGUOUS_MATCH", "REVIEW_REQUIRED", "INVALID_RECORD"}
 LABELS = [*ALL_CLASSES, "UNRESOLVED_PAIR", "NO_ROW"]
-SAFE_FOR_UNRESOLVED_PAIR = {
-    "MISSING_PARTNER_RECORD", "MISSING_INTERNAL_RECORD", "AMBIGUOUS_MATCH", "INVALID_RECORD",
-}  # fmt: skip
+# "attention": the engine raised a flag instead of pairing or clearing the record
+ATTENTION = {
+    "MISSING_PARTNER_RECORD",
+    "MISSING_INTERNAL_RECORD",
+    "REVIEW_REQUIRED",
+    "AMBIGUOUS_MATCH",
+    "INVALID_RECORD",
+}
+SAFE_FOR_UNRESOLVED_PAIR = ATTENTION
 
 
 def load_rows(gold_dir: Path) -> list[dict]:
@@ -47,7 +67,18 @@ def load_rows(gold_dir: Path) -> list[dict]:
     return rows
 
 
-def evaluate_run(truth: dict, rows: list[dict]) -> dict:
+def resolve_label(u: dict, params: dict) -> str:
+    """Policy-dependent truth: a unique single-typo pair is MATCHED under auto-matching, needs review
+    under suggest-only, and is out of reach when fallback is off or the settlement lag exceeds its window."""
+    label = u["expected_class"]
+    if label != "FUZZY_UNIQUE":
+        return label
+    if params["fb_max_edit"] < 1 or u["lag_seconds"] > params["fb_window_hours"] * 3600:
+        return "UNRESOLVED_PAIR"
+    return "MATCHED" if params["fb_auto"] == 1 else "REVIEW_REQUIRED"
+
+
+def evaluate_run(truth: dict, rows: list[dict], params: dict) -> dict:
     """Return additive raw counters so several seeds can be pooled before computing rates."""
     by_event, by_stmt = {}, {}
     for r in rows:
@@ -56,27 +87,26 @@ def evaluate_run(truth: dict, rows: list[dict]) -> dict:
         for s in r["partner_refs"] or []:
             by_stmt[s] = r
     by_key = {r["match_key"]: r for r in rows}
-    pred_pairs = set()
-    for r in rows:
-        if (
-            len(r["internal_refs"] or []) == 1
-            and len(r["partner_refs"] or []) == 1
-            and r["classification"] not in NOT_AUTO
-        ):
-            pred_pairs.add((r["internal_refs"][0], r["partner_refs"][0]))
+    pred_pairs = {
+        (r["internal_refs"][0], r["partner_refs"][0])
+        for r in rows
+        if len(r["internal_refs"] or []) == 1
+        and len(r["partner_refs"] or []) == 1
+        and r["classification"] not in NOT_AUTO
+    }
     true_pairs = {(p["event_id"], p["statement_row_id"]): p for p in truth["pairs"]}
     tp = pred_pairs & true_pairs.keys()
     resolvable = {k for k, p in true_pairs.items() if p["resolvable"]}
     c: Counter = Counter()
     c["pred_pairs"], c["true_pairs"] = len(pred_pairs), len(true_pairs)
-    c["tp_pairs"], c["false_pairs"] = len(tp), len(pred_pairs - set(true_pairs))
+    c["tp_pairs"], c["false_pairs"] = len(tp), len(pred_pairs - tp)
     c["resolvable_pairs"], c["resolvable_found"] = len(resolvable), len(pred_pairs & resolvable)
     c["internal_units"] = sum(u["kind"] == "internal" for u in truth["units"])
-    scen: dict[str, Counter] = defaultdict(Counter)
-    for (e, s), p in true_pairs.items():
-        scen[p["scenario"]]["true_pairs"] += 1
-        scen[p["scenario"]]["pairs_found"] += (e, s) in pred_pairs
     unit_by_id = {u["id"]: u for u in truth["units"]}
+    scen: dict[str, Counter] = defaultdict(Counter)
+    for (e, _s), p in true_pairs.items():
+        scen[p["scenario"]]["true_pairs"] += 1
+        scen[p["scenario"]]["pairs_found"] += (e, _s) in pred_pairs
     for e, _s in pred_pairs - set(true_pairs):
         u = unit_by_id.get(e)
         scen[u["scenario"] if u else "?"]["false_auto_matches"] += 1
@@ -89,46 +119,25 @@ def evaluate_run(truth: dict, rows: list[dict]) -> dict:
         else:
             row = by_stmt.get(u["id"])
         pred = row["classification"] if row else "NO_ROW"
-        reasons = set(row["reasons"]) if row else set()
-        true_label = u["expected_class"]
-        confusion[true_label][pred] += 1
-        o = u["outcome"]
+        label = resolve_label(u, params)
+        confusion[label][pred] += 1
         scen[u["scenario"]]["units"] += 1
-        auto = row is not None and u["id"] in paired_ids
-        if o == "ABSTAIN":
-            c["abstain_units"] += 1
-            c["abstain_explicit"] += pred == "AMBIGUOUS_MATCH"
-            c["abstain_wrongly_auto"] += auto
-        if o == "MISSING_PARTNER":
-            c["missing_partner_units"] += 1
-            c["missing_partner_found"] += ("MISSING_PARTNER_RECORD" in reasons) and not auto
-        if o == "MISSING_INTERNAL":
-            c["missing_internal_units"] += 1
-            c["missing_internal_found"] += ("MISSING_INTERNAL_RECORD" in reasons) and not auto
-        if true_label == "UNRESOLVED_PAIR":
-            c["unresolved_pair_units"] += 1
-            c["unresolved_pair_safe"] += (pred in SAFE_FOR_UNRESOLVED_PAIR) and not auto
-        if true_label == "DUPLICATE_EVENT":
-            c["dup_event_units"] += 1
-            c["dup_event_found"] += "DUPLICATE_EVENT" in reasons
-        if true_label == "DUPLICATE_STATEMENT":
-            c["dup_stmt_units"] += 1
-            c["dup_stmt_found"] += "DUPLICATE_STATEMENT" in reasons
-        if u["kind"] == "internal":
-            c["dup_event_flagged"] += "DUPLICATE_EVENT" in reasons
-            c["dup_stmt_flagged"] += "DUPLICATE_STATEMENT" in reasons
-        flagged = pred in UNRESOLVED
-        cur = u["currency"]
-        if u["unresolved"]:
-            exposure[cur]["truth_unresolved"] += u["amount_minor"]
-            if flagged or (true_label == "UNRESOLVED_PAIR" and pred in SAFE_FOR_UNRESOLVED_PAIR):
-                exposure[cur]["truth_unresolved_flagged"] += u["amount_minor"]
+        if label == "AMBIGUOUS_MATCH":
+            c["abstain_wrongly_auto"] += u["id"] in paired_ids
+        cur, amt = u["currency"], u["amount_minor"]
+        truly_unresolved = label in UNRESOLVED
+        engine_unresolved = pred in UNRESOLVED
+        if truly_unresolved:
+            exposure[cur]["truth_unresolved"] += amt
+            safe = label == "UNRESOLVED_PAIR" and pred in SAFE_FOR_UNRESOLVED_PAIR
+            if engine_unresolved or safe:
+                exposure[cur]["truth_unresolved_flagged"] += amt
             else:
-                exposure[cur]["falsely_cleared"] += u["amount_minor"]
-        elif flagged:
-            exposure[cur]["false_alarm"] += u["amount_minor"]
-        if flagged or pred in SAFE_FOR_UNRESOLVED_PAIR:
-            exposure[cur]["engine_reported_unresolved"] += u["amount_minor"]
+                exposure[cur]["falsely_cleared"] += amt
+        elif engine_unresolved:
+            exposure[cur]["false_alarm"] += amt
+        if engine_unresolved:
+            exposure[cur]["engine_reported_unresolved"] += amt
     return {
         "counts": dict(c),
         "scenarios": {k: dict(v) for k, v in scen.items()},
@@ -138,8 +147,12 @@ def evaluate_run(truth: dict, rows: list[dict]) -> dict:
 
 
 def pool(results: list[dict]) -> dict:
-    out: dict = {"counts": Counter(), "scenarios": defaultdict(Counter), "confusion": defaultdict(Counter),
-                 "exposure": defaultdict(Counter)}  # fmt: skip
+    out: dict = {
+        "counts": Counter(),
+        "scenarios": defaultdict(Counter),
+        "confusion": defaultdict(Counter),
+        "exposure": defaultdict(Counter),
+    }
     for r in results:
         out["counts"].update(r["counts"])
         for k in ("scenarios", "confusion", "exposure"):
@@ -152,25 +165,43 @@ def _r(n, d):
     return None if not d else round(n / d, 4)
 
 
+def _row(conf: dict, label: str) -> dict:
+    return conf.get(label, {})
+
+
 def summarize(p: dict) -> dict:
-    c = p["counts"]
-    cls_metrics = {}
+    c, conf = p["counts"], p["confusion"]
+    per_class = {}
     for cls in ALL_CLASSES:
-        tp = p["confusion"].get(cls, {}).get(cls, 0)
-        support = sum(p["confusion"].get(cls, {}).values())
-        # Flagging a true-but-unresolvable pair as missing/ambiguous is the *safe* outcome, so those
-        # units are not counted as false positives of the class (reported separately in missing_records).
-        predicted = sum(
-            row.get(cls, 0)
-            for true_label, row in p["confusion"].items()
-            if not (true_label == "UNRESOLVED_PAIR" and cls in SAFE_FOR_UNRESOLVED_PAIR)
-        )
+        support = sum(_row(conf, cls).values())
+        diag = _row(conf, cls).get(cls, 0)
+        predicted = sum(row.get(cls, 0) for row in conf.values())
+        if cls in SAFE_FOR_UNRESOLVED_PAIR:
+            predicted -= _row(conf, "UNRESOLVED_PAIR").get(cls, 0)
         if support or predicted:
-            pr, rc = _r(tp, predicted), _r(tp, support)
+            pr, rc = _r(diag, predicted), _r(diag, support)
             f1 = round(2 * pr * rc / (pr + rc), 4) if pr and rc else None
-            cls_metrics[cls] = dict(
-                support=support, predicted=predicted, tp=tp, precision=pr, recall=rc, f1=f1
+            per_class[cls] = dict(
+                support=support, predicted=predicted, tp=diag, precision=pr, recall=rc, f1=f1
             )
+
+    def missing(label: str) -> dict:
+        row = _row(conf, label)
+        n = sum(row.values())
+        return {
+            "units": n,
+            "exact_class": row.get(label, 0),
+            "exact_class_recall": _r(row.get(label, 0), n),
+            "flagged_for_attention": sum(v for k, v in row.items() if k in ATTENTION),
+            "attention_rate": _r(sum(v for k, v in row.items() if k in ATTENTION), n),
+            "wrongly_paired_or_cleared": sum(v for k, v in row.items() if k not in ATTENTION),
+        }
+
+    unres = _row(conf, "UNRESOLVED_PAIR")
+    n_unres = sum(unres.values())
+    abstain = _row(conf, "AMBIGUOUS_MATCH")
+    n_abs = sum(abstain.values())
+    col = lambda cls: sum(row.get(cls, 0) for row in conf.values())  # noqa: E731
     expo = {}
     for cur, e in sorted(p["exposure"].items()):
         expo[cur] = dict(e) | {
@@ -190,26 +221,43 @@ def summarize(p: dict) -> dict:
             "automation_rate_of_internal_records": _r(c["pred_pairs"], c["internal_units"]),
         },
         "missing_records": {
-            "missing_partner_recall": _r(c["missing_partner_found"], c["missing_partner_units"]),
-            "missing_internal_recall": _r(c["missing_internal_found"], c["missing_internal_units"]),
-            "unresolvable_pairs_flagged_safely": _r(
-                c["unresolved_pair_safe"], c["unresolved_pair_units"]
-            ),
+            "missing_partner": missing("MISSING_PARTNER_RECORD"),
+            "missing_internal": missing("MISSING_INTERNAL_RECORD"),
+            "unresolvable_pairs": {
+                "units": n_unres,
+                "flagged_not_matched": sum(
+                    v for k, v in unres.items() if k in SAFE_FOR_UNRESOLVED_PAIR
+                ),
+                "rate": _r(
+                    sum(v for k, v in unres.items() if k in SAFE_FOR_UNRESOLVED_PAIR), n_unres
+                ),
+            },
         },
         "duplicates": {
-            "duplicate_event_recall": _r(c["dup_event_found"], c["dup_event_units"]),
-            "duplicate_statement_recall": _r(c["dup_stmt_found"], c["dup_stmt_units"]),
-            "duplicate_event_precision": _r(c["dup_event_found"], c["dup_event_flagged"]),
-            "duplicate_statement_precision": _r(c["dup_stmt_found"], c["dup_stmt_flagged"]),
+            "duplicate_event_recall": _r(
+                _row(conf, "DUPLICATE_EVENT").get("DUPLICATE_EVENT", 0),
+                sum(_row(conf, "DUPLICATE_EVENT").values()),
+            ),
+            "duplicate_event_precision": _r(
+                _row(conf, "DUPLICATE_EVENT").get("DUPLICATE_EVENT", 0), col("DUPLICATE_EVENT")
+            ),
+            "duplicate_statement_recall": _r(
+                _row(conf, "DUPLICATE_STATEMENT").get("DUPLICATE_STATEMENT", 0),
+                sum(_row(conf, "DUPLICATE_STATEMENT").values()),
+            ),
+            "duplicate_statement_precision": _r(
+                _row(conf, "DUPLICATE_STATEMENT").get("DUPLICATE_STATEMENT", 0),
+                col("DUPLICATE_STATEMENT"),
+            ),
         },
         "ambiguity": {
-            "should_abstain_units": c["abstain_units"],
-            "correct_abstention_rate": _r(c["abstain_explicit"], c["abstain_units"]),
+            "should_abstain_units": n_abs,
+            "correct_abstention_rate": _r(abstain.get("AMBIGUOUS_MATCH", 0), n_abs),
             "wrongly_auto_matched": c["abstain_wrongly_auto"],
         },
-        "per_class": cls_metrics,
+        "per_class": per_class,
         "per_scenario": {k: dict(v) for k, v in sorted(p["scenarios"].items())},
-        "confusion_matrix": {k: dict(v) for k, v in p["confusion"].items()},
+        "confusion_matrix": {k: dict(v) for k, v in conf.items()},
         "exposure_by_currency": expo,
         "counts": dict(c),
     }
@@ -229,7 +277,16 @@ def prepare(home, split: str, seeds: list[int], payments: int) -> list[dict]:
     return prepared
 
 
+def default_params() -> dict:
+    return {
+        "fb_max_edit": FALLBACK_MAX_EDIT,
+        "fb_window_hours": FALLBACK_WINDOW_HOURS,
+        "fb_auto": FALLBACK_AUTO,
+    }
+
+
 def evaluate_params(prepared: list[dict], params: dict | None = None) -> dict:
+    eff = params or default_params()
     per_seed, results = [], []
     for item in prepared:
         paths = item["paths"]
@@ -237,16 +294,25 @@ def evaluate_params(prepared: list[dict], params: dict | None = None) -> dict:
         if params is not None:
             gold = paths.home / f"gold_{uuid.uuid4().hex[:6]}"
             reconcile(paths.silver, gold, **params)
-        res = evaluate_run(item["truth"], load_rows(gold))
+        res = evaluate_run(item["truth"], load_rows(gold), eff)
         results.append(res)
         s = summarize(pool([res]))
-        per_seed.append({"seed": item["seed"], **{k: s["automatic_matching"][k] for k in
-                         ("precision", "coverage_of_resolvable_pairs", "false_automatic_matches")}})  # fmt: skip
+        per_seed.append(
+            {
+                "seed": item["seed"],
+                **{
+                    k: s["automatic_matching"][k]
+                    for k in (
+                        "precision",
+                        "coverage_of_resolvable_pairs",
+                        "false_automatic_matches",
+                    )
+                },
+            }
+        )
     out = summarize(pool(results))
     out["per_seed"] = per_seed
-    out["params"] = params or {
-        "fb_max_edit": FALLBACK_MAX_EDIT, "fb_window_hours": FALLBACK_WINDOW_HOURS, "fb_auto": FALLBACK_AUTO,
-    }  # fmt: skip
+    out["params"] = eff
     return out
 
 
@@ -270,15 +336,24 @@ GRID = [
 ]
 
 
+def _pct(v):
+    return "n/a" if v is None else f"{100 * v:.2f}%"
+
+
 def run_sweep(prepared: list[dict]) -> dict:
     rows = []
     for params in GRID:
-        r = evaluate_params(prepared, params)
-        a = r["automatic_matching"]
-        rows.append({**params, "precision": a["precision"], "false_automatic_matches": a["false_automatic_matches"],
-                     "false_automatic_match_rate": a["false_automatic_match_rate"] or 0.0,
-                     "recall_of_all_true_pairs": a["recall_of_all_true_pairs"],
-                     "automation_rate": a["automation_rate_of_internal_records"]})  # fmt: skip
+        a = evaluate_params(prepared, params)["automatic_matching"]
+        rows.append(
+            {
+                **params,
+                "precision": a["precision"],
+                "false_automatic_matches": a["false_automatic_matches"],
+                "false_automatic_match_rate": a["false_automatic_match_rate"] or 0.0,
+                "recall_of_all_true_pairs": a["recall_of_all_true_pairs"],
+                "automation_rate": a["automation_rate_of_internal_records"],
+            }
+        )
     baseline = next(r for r in rows if r["fb_max_edit"] == 0)["false_automatic_match_rate"]
     ok = [
         r for r in rows if r["false_automatic_match_rate"] <= baseline + MAX_EXTRA_FALSE_AUTO_RATE
@@ -286,18 +361,17 @@ def run_sweep(prepared: list[dict]) -> dict:
     top = max(r["recall_of_all_true_pairs"] for r in ok)
     ties = [r for r in ok if r["recall_of_all_true_pairs"] == top]
     # Pre-registered tie-break: at equal recall prefer *suggesting* fuzzy candidates (fb_auto=0, edit 1,
-    # 24h) over doing nothing, because it surfaces probable matches for review at no precision cost.
+    # 24h, reported as REVIEW_REQUIRED) over doing nothing: it surfaces probable matches at no precision cost.
     best = next(
         (r for r in ties if (r["fb_max_edit"], r["fb_window_hours"], r["fb_auto"]) == (1, 24, 0)),
         ties[0],
     )
-    return {"rule": "max recall_of_all_true_pairs s.t. false_automatic_match_rate <= exact-key baseline "
-            f"({_pct(baseline)}) + {_pct(MAX_EXTRA_FALSE_AUTO_RATE)}",
-            "grid": rows, "selected": {k: best[k] for k in ("fb_max_edit", "fb_window_hours", "fb_auto")}}  # fmt: skip
-
-
-def _pct(v):
-    return "n/a" if v is None else f"{100 * v:.2f}%"
+    return {
+        "rule": "max recall_of_all_true_pairs s.t. false_automatic_match_rate <= exact-key baseline "
+        f"({_pct(baseline)}) + {_pct(MAX_EXTRA_FALSE_AUTO_RATE)}",
+        "grid": rows,
+        "selected": {k: best[k] for k in ("fb_max_edit", "fb_window_hours", "fb_auto")},
+    }
 
 
 def to_markdown(title: str, res: dict, sweep: dict | None = None, meta: dict | None = None) -> str:
@@ -307,35 +381,61 @@ def to_markdown(title: str, res: dict, sweep: dict | None = None, meta: dict | N
         res["duplicates"],
         res["ambiguity"],
     )
-    L = [f"# {title}", "",
-         "> All figures are measured against **controlled synthetic ground truth** from an adversarial "
-         "generator (`simulator/evaluation.py`). They do not estimate real-world accuracy.", ""]  # fmt: skip
+    L = [
+        f"# {title}",
+        "",
+        "> All figures are measured against **controlled synthetic ground truth** from an adversarial "
+        "generator (`simulator/evaluation.py`). They do not estimate real-world accuracy.",
+        "",
+    ]
     if meta:
         L += [*(f"- {k}: {v}" for k, v in meta.items()), ""]
-    L += [f"- engine parameters: `{res['params']}`", "", "## Automatic matching", "",
-          "| metric | value |", "|---|---|",
-          f"| automatic pairs decided | {a['predicted_pairs']} |",
-          f"| correct pairs | {a['correct_pairs']} |",
-          f"| **false automatic matches** | **{a['false_automatic_matches']}** ({_pct(a['false_automatic_match_rate'])} of automatic pairs) |",
-          f"| **precision** | **{_pct(a['precision'])}** |",
-          f"| coverage of resolvable pairs | {_pct(a['coverage_of_resolvable_pairs'])} |",
-          f"| recall of all true pairs | {_pct(a['recall_of_all_true_pairs'])} |",
-          f"| automation rate (internal records auto-paired) | {_pct(a['automation_rate_of_internal_records'])} |", "",
-          "## Missing / duplicate / ambiguous", "", "| metric | value |", "|---|---|",
-          f"| missing-partner records found | {_pct(m['missing_partner_recall'])} |",
-          f"| missing-internal (partner-only) records found | {_pct(m['missing_internal_recall'])} |",
-          f"| unresolvable true pairs flagged instead of mis-matched | {_pct(m['unresolvable_pairs_flagged_safely'])} |",
-          f"| duplicate events: recall / precision | {_pct(d['duplicate_event_recall'])} / {_pct(d['duplicate_event_precision'])} |",
-          f"| duplicate statements: recall / precision | {_pct(d['duplicate_statement_recall'])} / {_pct(d['duplicate_statement_precision'])} |",
-          f"| correct ambiguity abstention (n={amb['should_abstain_units']}) | {_pct(amb['correct_abstention_rate'])}; wrongly auto-matched: {amb['wrongly_auto_matched']} |", "",
-          "## Per-category detection (record level)", "",
-          "| class | support | predicted | precision | recall | F1 |", "|---|---|---|---|---|---|"]  # fmt: skip
+    mp, mi, up = m["missing_partner"], m["missing_internal"], m["unresolvable_pairs"]
+    L += [
+        f"- engine parameters: `{res['params']}`",
+        "",
+        "## Automatic matching (denominators: automatic pairs / true pairs / resolvable pairs)",
+        "",
+        "| metric | value |",
+        "|---|---|",
+        f"| automatic pairs decided | {a['predicted_pairs']} |",
+        f"| correct pairs | {a['correct_pairs']} |",
+        f"| **false automatic matches** | **{a['false_automatic_matches']}** ({_pct(a['false_automatic_match_rate'])} of automatic pairs) |",
+        f"| **precision** (correct / automatic) | **{_pct(a['precision'])}** |",
+        f"| coverage of resolvable pairs | {_pct(a['coverage_of_resolvable_pairs'])} |",
+        f"| recall of all true pairs | {_pct(a['recall_of_all_true_pairs'])} |",
+        f"| automation rate (automatic pairs / internal records) | {_pct(a['automation_rate_of_internal_records'])} |",
+        "",
+        "## Missing / duplicate / ambiguous (all derived from the confusion matrix below)",
+        "",
+        "| metric | numerator / denominator | value |",
+        "|---|---|---|",
+        f"| missing-partner: classified MISSING_PARTNER_RECORD | {mp['exact_class']}/{mp['units']} | {_pct(mp['exact_class_recall'])} |",
+        f"| missing-partner: flagged for attention (missing, review, ambiguous or invalid) | {mp['flagged_for_attention']}/{mp['units']} | {_pct(mp['attention_rate'])} |",
+        f"| missing-partner: wrongly paired or cleared | {mp['wrongly_paired_or_cleared']}/{mp['units']} | {_pct(_r(mp['wrongly_paired_or_cleared'], mp['units']))} |",
+        f"| partner-only: classified MISSING_INTERNAL_RECORD | {mi['exact_class']}/{mi['units']} | {_pct(mi['exact_class_recall'])} |",
+        f"| partner-only: flagged for attention | {mi['flagged_for_attention']}/{mi['units']} | {_pct(mi['attention_rate'])} |",
+        f"| unresolvable true pairs flagged, not matched | {up['flagged_not_matched']}/{up['units']} | {_pct(up['rate'])} |",
+        f"| duplicate events: recall / precision | | {_pct(d['duplicate_event_recall'])} / {_pct(d['duplicate_event_precision'])} |",
+        f"| duplicate statements: recall / precision | | {_pct(d['duplicate_statement_recall'])} / {_pct(d['duplicate_statement_precision'])} |",
+        f"| correct abstention on competing candidates | {res['confusion_matrix'].get('AMBIGUOUS_MATCH', {}).get('AMBIGUOUS_MATCH', 0)}/{amb['should_abstain_units']} | {_pct(amb['correct_abstention_rate'])}; wrongly auto-matched: {amb['wrongly_auto_matched']} |",
+        "",
+        "## Per-category detection (recall = diagonal / row total, precision = diagonal / column total)",
+        "",
+        "| class | support | predicted | precision | recall | F1 |",
+        "|---|---|---|---|---|---|",
+    ]
     for k, v in res["per_class"].items():
         L.append(
             f"| {k} | {v['support']} | {v['predicted']} | {_pct(v['precision'])} | {_pct(v['recall'])} | {_pct(v['f1'])} |"
         )
-    L += ["", "## Per-scenario outcome (true pairs found / false automatic matches)", "",
-          "| scenario | units | true pairs | pairs found | false automatic matches |", "|---|---|---|---|---|"]  # fmt: skip
+    L += [
+        "",
+        "## Per-scenario outcome (true pairs found / false automatic matches)",
+        "",
+        "| scenario | units | true pairs | pairs found | false automatic matches |",
+        "|---|---|---|---|---|",
+    ]
     for k, v in res["per_scenario"].items():
         L.append(
             f"| {k} | {v.get('units', 0)} | {v.get('true_pairs', 0)} | {v.get('pairs_found', 0)} | {v.get('false_auto_matches', 0)} |"
@@ -345,19 +445,36 @@ def to_markdown(title: str, res: dict, sweep: dict | None = None, meta: dict | N
         for x in LABELS
         if x in res["confusion_matrix"] or any(x in r for r in res["confusion_matrix"].values())
     ]
-    L += ["", "## Confusion matrix (rows: true category, columns: engine classification)", "",
-          "| true / predicted | " + " | ".join(labels) + " |", "|---|" + "---|" * len(labels)]  # fmt: skip
+    L += [
+        "",
+        "## Confusion matrix (rows: true category, columns: engine classification)",
+        "",
+        "| true / predicted | " + " | ".join(labels) + " |",
+        "|---|" + "---|" * len(labels),
+    ]
     for t in labels:
         row = res["confusion_matrix"].get(t)
         if row:
             L.append(f"| {t} | " + " | ".join(str(row.get(p, 0)) for p in labels) + " |")
-    L += ["", "UNRESOLVED_PAIR: a true pair the policy cannot safely resolve (2-edit typo, typo+amount difference); "
-          "the safe outcome is a missing/ambiguous flag, not a match.", "",
-          "## Unresolved financial exposure (integer minor units, per currency, never summed across currencies)", "",
-          "| currency | truth unresolved | flagged by engine | falsely cleared | false alarm | exposure recall |", "|---|---|---|---|---|---|"]  # fmt: skip
+    L += [
+        "",
+        "UNRESOLVED_PAIR: a true pair the policy cannot safely resolve (2-edit typo, typo plus amount difference, "
+        "or a single typo outside the time window); the safe outcome is a flag, not a match. "
+        "REVIEW_REQUIRED: one unique fuzzy candidate that is not matched automatically. "
+        "AMBIGUOUS_MATCH: competing candidates.",
+        "",
+        "## Unresolved financial exposure (integer minor units, per currency, never summed across currencies)",
+        "",
+        "Identity checked by tests: truly unresolved = flagged by engine + falsely cleared.",
+        "",
+        "| currency | truly unresolved | flagged by engine | falsely cleared | false alarm | exposure recall |",
+        "|---|---|---|---|---|---|",
+    ]
     for cur, e in res["exposure_by_currency"].items():
-        L.append(f"| {cur} | {e.get('truth_unresolved', 0)} | {e.get('truth_unresolved_flagged', 0)} | "
-                 f"{e.get('falsely_cleared', 0)} | {e.get('false_alarm', 0)} | {_pct(e.get('exposure_recall'))} |")  # fmt: skip
+        L.append(
+            f"| {cur} | {e.get('truth_unresolved', 0)} | {e.get('truth_unresolved_flagged', 0)} | "
+            f"{e.get('falsely_cleared', 0)} | {e.get('false_alarm', 0)} | {_pct(e.get('exposure_recall'))} |"
+        )
     L += [
         "",
         "## Per-seed stability",
@@ -370,16 +487,24 @@ def to_markdown(title: str, res: dict, sweep: dict | None = None, meta: dict | N
             f"| {s['seed']} | {_pct(s['precision'])} | {_pct(s['coverage_of_resolvable_pairs'])} | {s['false_automatic_matches']} |"
         )
     if sweep:
-        L += ["", "## Development-seed policy sweep", "", f"Selection rule (fixed in advance): {sweep['rule']}.", "",
-              "| max edit | window h | auto | precision | false auto matches | false-auto rate | recall of true pairs | automation |",
-              "|---|---|---|---|---|---|---|---|"]  # fmt: skip
+        L += [
+            "",
+            "## Development-seed policy sweep",
+            "",
+            f"Selection rule (fixed in advance): {sweep['rule']}.",
+            "",
+            "| max edit | window h | auto | precision | false auto matches | false-auto rate | recall of true pairs | automation |",
+            "|---|---|---|---|---|---|---|---|",
+        ]
         for r in sweep["grid"]:
             mark = (
                 " **(selected)**"
                 if all(r[k] == sweep["selected"][k] for k in sweep["selected"])
                 else ""
             )
-            L.append(f"| {r['fb_max_edit']} | {r['fb_window_hours']} | {r['fb_auto']} | {_pct(r['precision'])} | "
-                     f"{r['false_automatic_matches']} | {_pct(r['false_automatic_match_rate'])} | "
-                     f"{_pct(r['recall_of_all_true_pairs'])} | {_pct(r['automation_rate'])} |{mark}")  # fmt: skip
+            L.append(
+                f"| {r['fb_max_edit']} | {r['fb_window_hours']} | {r['fb_auto']} | {_pct(r['precision'])} | "
+                f"{r['false_automatic_matches']} | {_pct(r['false_automatic_match_rate'])} | "
+                f"{_pct(r['recall_of_all_true_pairs'])} | {_pct(r['automation_rate'])} |{mark}"
+            )
     return "\n".join(L) + "\n"

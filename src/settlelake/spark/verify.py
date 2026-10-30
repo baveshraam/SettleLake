@@ -13,7 +13,7 @@ COLS = (
     "match_key, classification, reasons, internal_amount_minor, internal_currency, "
     "partner_amount_minor, partner_currency, partner_status, settlement_lag_seconds, "
     "ingestion_lag_seconds, explanation, payment_id, corridor, internal_refs, partner_refs, "
-    "match_method, fallback_candidates"
+    "match_method, fallback_candidates, review_candidate_key"
 )
 
 

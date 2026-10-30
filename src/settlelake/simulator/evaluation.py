@@ -45,7 +45,8 @@ MIX = [
 ]
 UNRESOLVED = {
     "AMOUNT_MISMATCH", "CURRENCY_MISMATCH", "STATUS_MISMATCH", "MISSING_PARTNER_RECORD",
-    "MISSING_INTERNAL_RECORD", "AMBIGUOUS_MATCH", "INVALID_RECORD", "UNRESOLVED_PAIR",
+    "MISSING_INTERNAL_RECORD", "AMBIGUOUS_MATCH", "REVIEW_REQUIRED", "INVALID_RECORD",
+    "UNRESOLVED_PAIR",
 }  # fmt: skip
 
 
@@ -204,8 +205,14 @@ def generate_eval(paths: Paths, cfg: EvalConfig) -> dict:
         elif scen == "TYPO_1":
             s = stmt_row(p, mutate(ref, 1, set()))
             events.append(e)
-            unit("internal", e["event_id"], "AUTO_MATCH", "MATCHED", p["amount"], p["cur"],
+            # The correct *label* depends on the policy under test (auto-match vs review), so the
+            # sentinel is resolved by the evaluator from the engine parameters and this lag.
+            lag = (
+                datetime.strptime(s["settled_at"], "%Y-%m-%dT%H:%M:%SZ") - p["t"]
+            ).total_seconds()
+            unit("internal", e["event_id"], "AUTO_MATCH", "FUZZY_UNIQUE", p["amount"], p["cur"],
                  s["statement_row_id"], scen=scen)  # fmt: skip
+            units[-1]["lag_seconds"] = int(lag)
             pair(e, s, True, scen)
         elif scen in ("TYPO_2", "COMBINED_TYPO_AMOUNT"):
             kw = {}

@@ -2,8 +2,8 @@ import shutil
 
 import duckdb
 import pytest
-from conftest import settle_event as se
-from conftest import stmt_row as sr
+from helpers import settle_event as se
+from helpers import stmt_row as sr
 
 from settlelake.config import get_paths
 from settlelake.observability import reconcile_eval as E
@@ -25,14 +25,12 @@ def _recon(home, **params):
     return {r[0]: r[1:] for r in rows}
 
 
-def test_unique_fuzzy_candidate_is_suggested_not_auto_matched_by_default(mini):
+def test_unique_fuzzy_candidate_needs_review_and_is_never_paired_by_default(mini):
     mini([se("e1", "ATL-REF-100")], [sr("s1", "ATL-REF-101")])
     out = _recon(mini.home)  # frozen policy: suggest only
-    assert (
-        out["ATLAS|ATLREF100"][0] == "AMBIGUOUS_MATCH"
-        and out["ATLAS|ATLREF101"][0] == "AMBIGUOUS_MATCH"
-    )
-    assert out["ATLAS|ATLREF100"][3] == [] or out["ATLAS|ATLREF101"][2] == []  # never paired
+    a, b = out["ATLAS|ATLREF100"], out["ATLAS|ATLREF101"]
+    assert a[0] == b[0] == "REVIEW_REQUIRED"  # one unique candidate: review, NOT ambiguous
+    assert a[2] == ["e1"] and a[3] == [] and b[2] == [] and b[3] == ["s1"]  # records stay unpaired
 
 
 def test_fallback_auto_mode_matches_unique_pair_and_labels_method(mini):
@@ -48,9 +46,10 @@ def test_fallback_never_forces_non_unique_candidates(mini):
         [se("e1", "ATL-REF-100"), se("e2", "ATL-REF-102")],
         [sr("s1", "ATL-REF-101"), sr("s2", "ATL-REF-103")],
     )
-    out = _recon(mini.home, fb_auto=1)
-    assert {v[0] for v in out.values()} == {"AMBIGUOUS_MATCH"}
-    assert all(v[1] == "KEY" for v in out.values())
+    for auto in (0, 1):
+        out = _recon(mini.home, fb_auto=auto)
+        assert {v[0] for v in out.values()} == {"AMBIGUOUS_MATCH"}  # competing candidates
+        assert all(v[1] == "KEY" for v in out.values())
 
 
 @pytest.mark.parametrize(
@@ -87,6 +86,9 @@ def test_eval_is_independent_of_pipeline_and_abstains_on_collisions(prepared):
     res = E.evaluate_params(prepared)
     a, amb = res["automatic_matching"], res["ambiguity"]
     assert amb["correct_abstention_rate"] == 1.0 and amb["wrongly_auto_matched"] == 0
+    assert (
+        res["per_class"]["AMBIGUOUS_MATCH"]["precision"] == 1.0
+    )  # review no longer pollutes ambiguity
     # the only false automatic matches come from the two undetectable-by-design scenarios
     bad = {k for k, v in res["per_scenario"].items() if v.get("false_auto_matches")}
     assert bad <= {"WRONG_TARGET"}
