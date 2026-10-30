@@ -90,9 +90,10 @@ def _checks(t: dict[str, str]) -> list[tuple[str, str, str, str, str]]:
             "gold",
             "ERROR",
             "every internal settlement and partner statement key appears in reconciliation",
-            f"""SELECT count(*), count(*) FILTER (WHERE match_key NOT IN (SELECT match_key FROM {rec}))
+            f"""SELECT count(*), count(*) FILTER (WHERE r.match_key IS NULL)
              FROM (SELECT match_key FROM {ev} WHERE event_type = 'funds.settled'
-                   UNION SELECT match_key FROM {st})""",
+                   UNION SELECT match_key FROM {st}) k
+             LEFT JOIN (SELECT DISTINCT match_key FROM {rec}) r ON r.match_key = k.match_key""",
         ),
         (
             "gold_matched_totals_tie_out",
@@ -121,9 +122,9 @@ def _checks(t: dict[str, str]) -> list[tuple[str, str, str, str, str]]:
             "gold",
             "ERROR",
             "every fact_settlements payment_id exists in fact_payments",
-            f"""SELECT count(*), count(*) FILTER (WHERE payment_id NOT IN
-             (SELECT payment_id FROM {fp}))
-             FROM {fs}""",
+            f"""SELECT count(*), count(*) FILTER (WHERE p.payment_id IS NULL)
+             FROM {fs} s LEFT JOIN (SELECT DISTINCT payment_id FROM {fp}) p
+               ON p.payment_id = s.payment_id""",
         ),
         (
             "source_schema_compliance",
@@ -147,8 +148,10 @@ def _checks(t: dict[str, str]) -> list[tuple[str, str, str, str, str]]:
             "silver",
             "WARN",
             "events whose payment has no payment.created event",
-            f"""SELECT count(*), count(*) FILTER (WHERE payment_id NOT IN
-             (SELECT payment_id FROM {ev} WHERE event_type = 'payment.created')) FROM {ev}""",
+            f"""SELECT count(*), count(*) FILTER (WHERE c.payment_id IS NULL)
+             FROM {ev} e LEFT JOIN (SELECT DISTINCT payment_id FROM {ev}
+                                    WHERE event_type = 'payment.created') c
+               ON c.payment_id = e.payment_id""",
         ),
         (
             "source_lifecycle_consistency",

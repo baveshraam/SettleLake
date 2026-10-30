@@ -78,7 +78,7 @@ jobs:
           cache-dependency-path: pyproject.toml
       - run: python -m pip install -e ".[dev,stream]"
       - run: bash scripts/install_spark_jars.sh
-      - run: pytest tests/spark -v
+      - run: pytest tests/spark -v --cov=settlelake.spark --cov-report=term-missing
 
   terraform:
     runs-on: ubuntu-latest
