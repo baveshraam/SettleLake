@@ -70,7 +70,7 @@ DELAY_SLA_HOURS = 48
 
 # Fallback matching of rows whose references differ: max Levenshtein distance between normalised
 # references (0 disables it) and max |partner settled_at - internal event_time|. Values chosen on the
-# development seeds only (see docs/evaluation.md).
+# development seeds only.
 FALLBACK_MAX_EDIT = 1
 FALLBACK_WINDOW_HOURS = 24
 # 1 = a unique mutual fuzzy candidate is matched automatically; 0 = it is only suggested (AMBIGUOUS_MATCH).

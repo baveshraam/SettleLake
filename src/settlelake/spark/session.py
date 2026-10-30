@@ -4,7 +4,7 @@
   jdbc   JDBC catalog (Postgres) + S3FileIO    (docker compose with MinIO)
   glue   AWS Glue catalog + S3FileIO           (AWS; queryable from Athena)
 
-Configured through environment variables (see docs/runbook.md).
+Configured through environment variables.
 """
 
 from __future__ import annotations
